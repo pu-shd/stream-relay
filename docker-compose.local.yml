@@ -1,0 +1,81 @@
+# Local relay stack - no cloud, no spend.
+#
+# A strict upgrade on page-stream's `srt-test-listener`, which writes .ts files you can
+# only inspect after the fact. This serves live HLS you can watch in a browser or VLC
+# while a capture is running.
+#
+#   export SRT_PUBLISH_PASSPHRASE=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 40)
+#   docker-compose -f docker-compose.local.yml up -d
+#   open http://127.0.0.1:8888/news/index.m3u8
+#
+# Publish from page-stream (relay mode):
+#   node dist/index.js --url https://orfe.princeton.edu/news \
+#     --ingest "srt://127.0.0.1:8890?streamid=publish:news&passphrase=$SRT_PUBLISH_PASSPHRASE&pbkeylen=32"
+#
+# Or bring up the built-in test pattern instead:
+#   docker-compose -f docker-compose.local.yml --profile testsrc up -d
+
+services:
+  relay:
+    build:
+      context: ./docker/mediamtx
+    image: stream-relay-mediamtx:local
+    container_name: stream-relay
+    environment:
+      # Required. The entrypoint fails closed if unset, too short/long, or containing
+      # characters outside [A-Za-z0-9_-].
+      - SRT_PUBLISH_PASSPHRASE=${SRT_PUBLISH_PASSPHRASE:?set SRT_PUBLISH_PASSPHRASE first}
+    volumes:
+      # The generated mediamtx.yml.tmpl lives in the config repo, checked out alongside.
+      - ../stream-relay-config/orfe:/config:ro
+    ports:
+      - "8890:8890/udp"   # SRT ingest
+      - "8888:8888"       # HLS egress
+      # API (9997) and metrics (9998) bind to loopback inside the container by design
+      # and are deliberately not published.
+    restart: unless-stopped
+
+  # Optional test pattern, so the stack is verifiable without page-stream running.
+  testsrc:
+    image: stream-relay-mediamtx:local
+    container_name: stream-relay-testsrc
+    profiles: ["testsrc"]
+    depends_on:
+      relay:
+        condition: service_healthy
+    entrypoint: ["ffmpeg"]
+    command:
+      - "-hide_banner"
+      - "-loglevel"
+      - "warning"
+      - "-re"
+      - "-f"
+      - "lavfi"
+      - "-i"
+      - "testsrc=size=1920x1080:rate=30"
+      # MediaMTX accepts video-only, but page-stream always ships a silent AAC track, so
+      # the local stack mirrors production rather than testing a shape we never send.
+      - "-f"
+      - "lavfi"
+      - "-i"
+      - "anullsrc=channel_layout=stereo:sample_rate=44100"
+      - "-c:v"
+      - "libx264"
+      - "-preset"
+      - "veryfast"
+      - "-tune"
+      - "zerolatency"
+      - "-pix_fmt"
+      - "yuv420p"
+      - "-b:v"
+      - "1500k"
+      - "-g"
+      - "60"
+      - "-c:a"
+      - "aac"
+      - "-b:a"
+      - "128k"
+      - "-f"
+      - "mpegts"
+      - "srt://relay:8890?streamid=publish:news&passphrase=${SRT_PUBLISH_PASSPHRASE}&pbkeylen=32&latency=200000"
+    restart: unless-stopped

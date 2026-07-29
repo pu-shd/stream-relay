@@ -1,0 +1,16 @@
+# Bootstrap/deploy state - machine-local. Records completed steps so a failed run can
+# resume; Azure itself remains the source of truth, so losing this file is never fatal.
+.stream-relay-state.json
+
+# Never commit a passphrase. It lives in Key Vault and reaches the container as an env
+# var; the rendered mediamtx.yml (with the secret substituted in) is written to /tmp
+# inside the container and must never be written here.
+mediamtx.yml
+*.secrets.sh
+.env
+.env.local
+
+# Local scratch
+.relaycmp/
+*.log
+.DS_Store
