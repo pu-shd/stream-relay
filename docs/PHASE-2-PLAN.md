@@ -247,6 +247,34 @@ any traffic.
 | Key Vault soft-delete blocks redeploy of the same name | Use `--enable-purge-protection false` for a standby, and handle "vault exists in soft-deleted state" in step 6 |
 | `--hard` teardown run by accident | Requires typing the resource-group name; `--yes` only for CI |
 
+## 7b. Outcome (2026-07-29)
+
+Phase 2 delivered. Findings from building it, beyond the two anticipated in §2:
+
+1. **macOS ships bash 3.2, and three scripts used bash 4+ constructs** (`${VAR^^}`, `mapfile`).
+   They failed immediately on the primary development platform. All scripts are now 3.2-safe, and
+   CI greps for the constructs so they cannot creep back in — Ubuntu's bash 5 would happily run
+   them and hide the breakage.
+2. **`--dry-run` printed "✓ created resource group" without creating anything.** A cosmetic bug
+   with real consequences: the whole value of a dry run is trusting what it reports. Fixed, and
+   the completion banner now distinguishes `--dry-run` from `--dry-run --allow-rg`.
+3. **`what-if` cannot run without an existing resource group**, and azure-cli 2.88 *crashes*
+   while rendering the resulting error (`RuntimeError: The content for this response was already
+   consumed`), burying the cause entirely. Added `--allow-rg` to create just the free empty group,
+   plus a `validate` fallback that surfaces the real error when the CLI bug strikes.
+4. **`what-if` evaluated `Microsoft.Cdn` resources while the provider was NotRegistered.** So a
+   clean what-if is *not* evidence the deployment will succeed — vindicating `preflight` and
+   `register-providers` as distinct steps rather than trusting the template check.
+5. Two shell bugs shellcheck could not see: a `test` missing its closing `]` (the provider wait
+   would have spun to timeout), and a function whose last command returned non-zero on the
+   *success* path, which would have recorded a false step failure.
+6. `az acr build` replaced a local `docker push`: building server-side avoids producing an arm64
+   image on a Mac for an amd64 VM.
+
+Verified against `ORFE-dept-azure`: preflight passes (Owner, 350 vCPU free), Bicep and the
+generated `.bicepparam` compile, and what-if reports **22 resource creations** plus 2
+`Unsupported` (nested role assignments, a documented what-if limitation, not an error).
+
 ## 8. Deliverables
 
 - [ ] 2.1–2.3 corrections: `frontdoor_hostname`, `relay_host()`, `--print-dns` guard, naming, region

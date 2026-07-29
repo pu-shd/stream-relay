@@ -14,3 +14,6 @@ mediamtx.yml
 .relaycmp/
 *.log
 .DS_Store
+.what-if.json
+.validate.json
+.restrict-history

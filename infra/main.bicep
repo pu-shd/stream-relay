@@ -1,12 +1,15 @@
 // stream-relay Azure infrastructure.
 //
-// PHASE 2 — NOT YET IMPLEMENTED. This file currently declares only the PARAMETER
-// CONTRACT that the config repo's generated infra.bicepparam binds to, so the two stay
-// in sync and `az bicep build` succeeds before any resources exist. Adding resources is
-// Phase 2 work; the notes below are the binding design constraints for whoever does it.
-//
 // Deploy target is a resource group:
-//   az deployment group create -g <rg> -f infra/main.bicep -p ../stream-relay-config/orfe/infra.bicepparam
+//   az deployment group create -g <rg> -f infra/main.bicep \
+//       -p ../stream-relay-config/orfe/infra.bicepparam
+//
+// Parameters are bound from the config repo's GENERATED infra.bicepparam, which is
+// rendered from relay.yml. Do not hand-edit that file.
+//
+// Read the module headers before changing anything. Several settings look cosmetic and
+// are not: the Front Door cache rules, the endpoint hash-reuse scope, and the static
+// public IP each prevent a specific, expensive failure.
 
 targetScope = 'resourceGroup'
 
@@ -31,7 +34,7 @@ param vmSize string
 @description('Front Door Standard profile name. Standard is required and sufficient: it supports custom WAF rules, rate limiting, and Ignore-Specified-Query-Strings. Only managed rule sets need Premium.')
 param frontDoorProfileName string
 
-@description('Front Door endpoint name. Yields <name>.azurefd.net, which must keep working permanently as a fallback hostname.')
+@description('Front Door endpoint name. Yields <name>-<hash>.z01.azurefd.net; the hash is NOT predictable and is discovered post-deploy.')
 param frontDoorEndpointName string
 
 @description('Custom domain, or empty string for Phase A. Front Door needs BOTH a _dnsauth TXT record and the CNAME before it will issue a managed certificate.')
@@ -58,51 +61,126 @@ param campusRanges array = []
 @description('MediaMTX path names, one per channel. Used to build per-path health probes and cache rules.')
 param relayPaths array
 
+@description('Key Vault secret name for the SRT publish passphrase.')
+param passphraseSecretName string = 'srt-publish-passphrase'
+
+@description('Emails for budget alerts.')
+param alertEmails array = ['bino@princeton.edu']
+
+@description('Budget start date, YYYY-MM-01. Passed in because Bicep cannot compute a deterministic first-of-month without utcNow(), which is disallowed outside parameter defaults.')
+param budgetStartDate string
+
+@description('Object ID of the operator who bootstraps the vault (needs Secrets Officer to CREATE the passphrase). Empty to skip.')
+param operatorObjectId string = ''
+
+@description('Optional SSH public key. Empty means no inbound SSH path at all; manage the VM via Run Command.')
+param sshPublicKey string = ''
+
+@description('Source CIDRs allowed to publish via SRT. Empty means Internet - acceptable only because the stream is encrypted and the passphrase gates publishing.')
+param ingestAllowedSources array = []
+
+var namePrefix = 'relay'
+
+module identity 'modules/identity.bicep' = {
+  name: 'identity-deploy'
+  params: {
+    identityName: identityName
+    location: location
+  }
+}
+
+module keyVault 'modules/keyvault.bicep' = {
+  name: 'keyvault-deploy'
+  params: {
+    keyVaultName: keyVaultName
+    location: location
+    readerPrincipalId: identity.outputs.principalId
+    adminPrincipalId: operatorObjectId
+  }
+}
+
+module registry 'modules/acr.bicep' = {
+  name: 'acr-deploy'
+  params: {
+    acrName: acrName
+    location: location
+    pullPrincipalId: identity.outputs.principalId
+  }
+}
+
+module network 'modules/network.bicep' = {
+  name: 'network-deploy'
+  params: {
+    namePrefix: namePrefix
+    location: location
+    srtPort: srtPort
+    ingestAllowedSources: ingestAllowedSources
+    // pugwipsEnabled tightens HLS egress to campus ranges instead of allowing the whole
+    // Front Door backend tag.
+    restrictEgressToCampus: pugwipsEnabled
+    campusRanges: campusRanges
+  }
+}
+
+module relayVm 'modules/vm.bicep' = {
+  name: 'vm-deploy'
+  params: {
+    vmName: vmName
+    location: location
+    vmSize: vmSize
+    subnetId: network.outputs.subnetId
+    publicIpId: network.outputs.publicIpId
+    identityId: identity.outputs.id
+    identityClientId: identity.outputs.clientId
+    acrLoginServer: registry.outputs.loginServer
+    keyVaultName: keyVault.outputs.name
+    passphraseSecretName: passphraseSecretName
+    sshPublicKey: sshPublicKey
+  }
+}
+
+module frontDoor 'modules/frontdoor.bicep' = {
+  name: 'frontdoor-deploy'
+  params: {
+    profileName: frontDoorProfileName
+    endpointName: frontDoorEndpointName
+    originHostName: network.outputs.publicIpAddress
+    customDomain: customDomain
+    wafRateLimitRpm: wafRateLimitRpm
+  }
+}
+
+module guardrails 'modules/guardrails.bicep' = {
+  name: 'guardrails-deploy'
+  params: {
+    budgetName: '${namePrefix}-budget'
+    budgetAlertUsd: budgetAlertUsd
+    budgetWarnUsd: budgetWarnUsd
+    notificationEmails: alertEmails
+    startDate: budgetStartDate
+  }
+}
+
 // ---------------------------------------------------------------------------------------
-// TODO(phase-2): resources. Binding constraints, each learned the hard way:
-//
-//  1. FRONT DOOR CACHE KEY — MUST ignore the 'session' query parameter. MediaMTX appends
-//     a per-viewer '?session=<uuid>' to every variant playlist URL in EVERY hlsVariant.
-//     Without this the cache hit rate is ~0 and origin egress roughly doubles the bill.
-//
-//  2. FRONT DOOR CACHE TTL — MUST be set explicitly on manifests. MediaMTX emits no
-//     Cache-Control, and Front Door then assigns a RANDOM 1-3 day TTL, which would pin a
-//     stale playlist for days. Short TTL on *.m3u8, longer on segments.
-//
-//  3. NSG — open ONLY srtPort/UDP (ingest) and 8888/TCP from the Front Door service tag
-//     (egress). MediaMTX's API (9997) and metrics (9998) bind to loopback in the
-//     generated config; never add NSG rules for them.
-//
-//  4. ACR PULL — grant the identity 'Container Registry Repository Reader' on
-//     ABAC-enabled registries, or 'AcrPull' on non-ABAC ones. Not GHCR: it has no
-//     managed-identity path and would force a stored PAT onto the VM.
-//
-//  5. BUDGET — provision the budget + anomaly alert here rather than by hand, so a
-//     teardown/redeploy cycle cannot silently drop the cost guardrail.
-//
-//  6. PUBLIC IP — must be static. The page-stream producers hold it in their ingest URLs,
-//     and a dynamic IP would silently break every publisher on VM restart.
+// Outputs. deploy.sh consumes these; discover-hostname writes frontDoorHostName back into
+// relay.yml. Nothing here is a credential.
 // ---------------------------------------------------------------------------------------
 
-// Surfaced so `what-if` and the mock-az tests can assert the contract before resources
-// exist. Every value here is a deployment target, never a credential.
-output plannedVmSize string = vmSize
-output plannedRegion string = location
-output relayPathCount int = length(relayPaths)
-output customDomainConfigured bool = !empty(customDomain)
-output defaultHostname string = '${frontDoorEndpointName}.azurefd.net'
-output pugwipsActive bool = pugwipsEnabled
-output campusRangeCount int = length(campusRanges)
+@description('THE authoritative Front Door hostname. Never construct <endpoint>.azurefd.net - that name does not resolve.')
+output frontDoorHostName string = frontDoor.outputs.endpointHostName
+
+@description('Static public IP for SRT ingest. The page-stream producers embed this.')
+output ingestIpAddress string = network.outputs.publicIpAddress
+
 output ingestPort int = srtPort
-output guardrails object = {
-  wafRateLimitRpm: wafRateLimitRpm
-  budgetWarnUsd: budgetWarnUsd
-  budgetAlertUsd: budgetAlertUsd
-}
-output identityNames object = {
-  identity: identityName
-  keyVault: keyVaultName
-  acr: acrName
-  vm: vmName
-  frontDoorProfile: frontDoorProfileName
-}
+output ingestUrlTemplate string = 'srt://${network.outputs.publicIpAddress}:${srtPort}?streamid=publish:<path>&passphrase=<secret>&pbkeylen=32&latency=200000'
+output acrLoginServer string = registry.outputs.loginServer
+output keyVaultName string = keyVault.outputs.name
+output identityClientId string = identity.outputs.clientId
+output identityPrincipalId string = identity.outputs.principalId
+output vmName string = relayVm.outputs.name
+output nsgName string = network.outputs.nsgName
+output wafPolicyName string = frontDoor.outputs.wafPolicyName
+output customDomainValidationToken string = frontDoor.outputs.customDomainValidationToken
+output relayPathCount int = length(relayPaths)
+output hlsUrls array = [for p in relayPaths: 'https://${frontDoor.outputs.endpointHostName}/${p}/index.m3u8']
