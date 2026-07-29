@@ -107,7 +107,6 @@ step_header 2 8 "--dry-run makes no mutating calls"
 reset_state; reset_log
 out=$(run_deploy fresh --dry-run)
 rc=$?
-n=$(mutating_calls)
 if [ "$rc" -eq 0 ]; then t_ok "dry run succeeded"; else t_fail "dry run failed:\n$out"; fi
 # what-if is read-only; `provider register` is the one legitimate exception we exclude.
 n_bad=$(grep -E '(^| )(create|delete|set|update|build)( |$)' "$SANDBOX/az.log" 2>/dev/null \

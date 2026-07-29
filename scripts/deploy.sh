@@ -23,8 +23,6 @@ DEPT="${DEPT:-orfe}"
 CONFIG_REPO="${CONFIG_REPO:-$REPO_ROOT/../stream-relay-config}"
 DEPT_DIR="$CONFIG_REPO/$DEPT"
 
-# Consumed by scripts/lib/steps.sh and lib/state.sh after sourcing.
-# shellcheck disable=SC2034
 DRY_RUN=0
 RESUME=0
 ALLOW_RG=0
@@ -38,6 +36,10 @@ usage() {
   exit 0
 }
 
+# Flags assigned here are read by the sourced libraries (lib/steps.sh, lib/state.sh),
+# which shellcheck cannot follow through a dynamic source path. Scoped to this loop
+# rather than the whole file, so a genuine unused variable elsewhere still gets caught.
+# shellcheck disable=SC2034
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)     DRY_RUN=1 ;;
