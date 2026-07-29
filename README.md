@@ -17,23 +17,41 @@ single line of `page-stream`**.
 
 ## Status
 
-**Phase 0–1 complete and verified. Phases 2–5 are designed but not implemented.** Everything
-below is documented as designed; this table is the honest picture of what exists today.
+**Phases 0–2 complete. Phases 3–5 designed but not implemented.** This table is the honest
+picture of what exists today; everything else below is documented as designed.
 
 | Component | State |
 | :--- | :--- |
-| `relay.yml` schema + `render-relay.py` (config repo) | ✅ 74 tests passing |
-| MediaMTX image + fail-closed entrypoint | ✅ verified |
+| `relay.yml` schema + `render-relay.py` (config repo) | ✅ 103 tests passing |
+| MediaMTX image + fail-closed entrypoint | ✅ verified against a real MediaMTX |
 | Local stack (`docker-compose.local.yml`) | ✅ verified |
 | Integration test: encrypted SRT → HLS → ffprobe | ✅ 18 assertions passing |
-| `infra/main.bicep` | ⚠️ parameter contract only — declares no resources yet |
-| `scripts/{bootstrap,deploy,update,teardown,restrict,allow-all}.sh` | ❌ Phase 2 |
-| `tests/mock-az/` | ❌ Phase 2 |
+| `infra/main.bicep` + 7 modules | ✅ compiles; 22 resource creations validated by what-if |
+| `scripts/{bootstrap,deploy,update,teardown,restrict,allow-all,verify}.sh` | ✅ written, bash 3.2-safe |
+| `tests/mock-az/` | ✅ 25 assertions passing (offline) |
+| **Behaviour of the deployed service** | ⚠️ **UNPROVEN — needs a real deploy** |
 | GitOps deploy workflow + OIDC | ❌ Phase 3 |
 | pugwips module | ❌ Phase 4 |
 | `page-stream-config --profile relay` cutover flag | ❌ Phase 5 |
 
-No Azure resources have ever been created by this repo. Cost to date: **$0**.
+**No billable Azure resource has ever been created. Cost to date: $0.** An empty resource group
+(`orfe-dept-azure-relay-rg`) exists in `ORFE-dept-azure` so that `what-if` has a scope to run in;
+resource groups are free and it holds nothing. Remove it any time with
+`az group delete -n orfe-dept-azure-relay-rg --yes`.
+
+### What "Phase 2 complete" does not mean
+
+`what-if` validates the *shape* of a deployment, not its *behaviour*. Two of the most expensive
+things in this design remain unverified until someone actually deploys:
+
+- whether the cache rule really collapses the `?session=` key (get it wrong and egress roughly
+  doubles);
+- whether the Front Door hostname survives a teardown/redeploy cycle.
+
+`scripts/verify.sh` asserts both, but it needs a live endpoint. Also note that what-if happily
+evaluated `Microsoft.Cdn` resources while that provider was still **NotRegistered** on the
+subscription — so what-if would not have caught a real blocker, which is exactly why
+`preflight` and `register-providers` are separate steps.
 
 ## Contents
 

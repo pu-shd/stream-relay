@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Mock `az`, placed first on PATH so the deployment scripts run entirely offline.
+#
+# Two jobs:
+#   1. Return canned answers driven by $MOCK_AZ_SCENARIO.
+#   2. Record every invocation to $MOCK_AZ_LOG so tests can assert on argv - which is how
+#      idempotency ("a second run makes no mutating calls") is proven, and how we check the
+#      passphrase never appears on a command line.
+#
+# Deliberately dumb: it pattern-matches argv rather than modelling Azure. A mock that tried
+# to be a real resource graph would grow bugs of its own and stop being trustworthy.
+set -uo pipefail
+
+MOCK_AZ_LOG="${MOCK_AZ_LOG:-/tmp/mock-az.log}"
+MOCK_AZ_SCENARIO="${MOCK_AZ_SCENARIO:-fresh}"
+
+printf '%s\n' "$*" >> "$MOCK_AZ_LOG"
+
+# Which resources "exist" in this scenario. `fresh` = nothing; `existing` = everything;
+# `partial` = up to the network step; `cdn-unregistered` mirrors the real ORFE subscription.
+resource_exists() {
+  case "$MOCK_AZ_SCENARIO" in
+    # orphaned-disk models "everything existed, teardown ran, but a disk survived", so the
+    # resources must exist or teardown exits early and never reaches the orphan check.
+    existing|orphaned-disk) return 0 ;;
+    partial)
+      case "$1" in
+        group|identity|keyvault|acr|network) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+emit() { printf '%s' "$1"; }
+
+case "$1 ${2:-} ${3:-}" in
+  "account show "*)
+    emit '{"id":"00000000-0000-0000-0000-000000000000","name":"MOCK-sub","user":{"name":"mock@princeton.edu"},"tenantId":"11111111-1111-1111-1111-111111111111"}'
+    ;;
+
+  "account list "*|"account list")
+    emit $'MOCK-sub\t00000000-0000-0000-0000-000000000000'
+    ;;
+
+  "account set "*) ;;
+
+  "bicep version"*) emit 'Bicep CLI version 0.43.8' ;;
+
+  "ad signed-in-user show"*) emit '22222222-2222-2222-2222-222222222222' ;;
+
+  "role assignment list"*)
+    # The fail-closed preflight test flips this to Contributor.
+    if [ "$MOCK_AZ_SCENARIO" = "contributor-only" ]; then
+      emit $'Contributor'
+    else
+      emit $'Owner'
+    fi
+    ;;
+
+  "provider show "*)
+    ns=""
+    for ((i = 1; i <= $#; i++)); do
+      [ "${!i}" = "-n" ] && { j=$((i + 1)); ns="${!j}"; }
+    done
+    # Microsoft.Cdn is NotRegistered in the scenario that mirrors reality, so the test can
+    # assert step 2 actually registers it rather than failing later at Front Door.
+    if [ "$MOCK_AZ_SCENARIO" = "cdn-unregistered" ] && [ "$ns" = "Microsoft.Cdn" ]; then
+      if [ -f "${MOCK_AZ_STATE_DIR:-/tmp}/cdn-registered" ]; then
+        emit 'Registered'
+      else
+        emit 'NotRegistered'
+      fi
+    else
+      emit 'Registered'
+    fi
+    ;;
+
+  "provider register"*)
+    touch "${MOCK_AZ_STATE_DIR:-/tmp}/cdn-registered"
+    ;;
+
+  "vm list-usage"*)
+    if [ "$MOCK_AZ_SCENARIO" = "no-quota" ]; then
+      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":350,"limit":350}]'
+    else
+      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":0,"limit":350}]'
+    fi
+    ;;
+
+  "vm list-skus"*)
+    # The scripts ask two different questions of this command: "does the SKU exist"
+    # (JSON) and "what are its restrictions" (-o tsv). Answering both with JSON made an
+    # unrestricted SKU look restricted, so the mock distinguishes them.
+    if printf '%s' "$*" | grep -q 'reasonCode'; then
+      [ "$MOCK_AZ_SCENARIO" = "sku-restricted" ] && emit 'NotAvailableForSubscription' || emit ''
+    else
+      emit '[{"name":"Standard_D4s_v6","restrictions":[]}]'
+    fi
+    ;;
+
+  "group exists"*)
+    resource_exists group && emit 'true' || emit 'false'
+    ;;
+
+  "group create"*|"group delete"*) ;;
+
+  "deployment group what-if"*) emit '{"changes":[]}' ;;
+
+  "deployment group create"*)
+    emit '{"properties":{"outputs":{
+      "frontDoorHostName":{"value":"orfe-relay-mockhash1234.z01.azurefd.net"},
+      "ingestIpAddress":{"value":"203.0.113.42"},
+      "acrLoginServer":{"value":"acrorfestreamrelay.azurecr.io"},
+      "keyVaultName":{"value":"kv-orfe-relay"},
+      "identityClientId":{"value":"33333333-3333-3333-3333-333333333333"}}}}'
+    ;;
+
+  "keyvault secret show"*)
+    resource_exists secret && emit '{"value":"MockPassphrase0123456789abcdefghij"}' || exit 1
+    ;;
+
+  "keyvault secret set"*) ;;
+
+  "acr build"*) ;;
+
+  "afd endpoint show"*) emit 'orfe-relay-mockhash1234.z01.azurefd.net' ;;
+
+  "afd custom-domain show"*)
+    emit 'Pending'
+    ;;
+
+  "afd profile show"*) resource_exists frontdoor || exit 1 ;;
+  "afd profile delete"*) ;;
+
+  "vm show"*) resource_exists vm || exit 1 ;;
+  "vm delete"*) ;;
+  "vm run-command invoke"*) emit '{"value":[{"message":"Up 10 seconds"}]}' ;;
+
+  "network nsg show"*|"network vnet show"*|"network nic show"*)
+    resource_exists network || exit 1 ;;
+  "network public-ip show"*) resource_exists network || exit 1 ;;
+  "network nsg rule update"*) ;;
+  "network nsg delete"*|"network vnet delete"*|"network nic delete"*|"network public-ip delete"*) ;;
+  "network front-door waf-policy show"*) resource_exists frontdoor || exit 1 ;;
+  "network front-door waf-policy delete"*) ;;
+
+  "resource list"*)
+    # teardown.sh asks twice: once for a table of everything, and once with a type filter
+    # (-o tsv) to detect leftover BILLABLE resources. Ignoring the filter made the orphan
+    # check fire always, so the mock distinguishes them.
+    if printf '%s' "$*" | grep -q 'Microsoft.Compute/disks'; then
+      case "$MOCK_AZ_SCENARIO" in
+        orphaned-disk) emit 'leftover-disk' ;;
+        *) emit '' ;;
+      esac
+      exit 0
+    fi
+    case "$MOCK_AZ_SCENARIO" in
+      after-soft-teardown)
+        # ACR, Key Vault and the identity survive --soft on purpose; nothing billable
+        # by the hour remains.
+        emit '[{"name":"acrorfestreamrelay","type":"Microsoft.ContainerRegistry/registries"},{"name":"kv-orfe-relay","type":"Microsoft.KeyVault/vaults"},{"name":"id-orfe-relay","type":"Microsoft.ManagedIdentity/userAssignedIdentities"}]'
+        ;;
+      orphaned-disk)
+        emit '[{"name":"leftover-disk","type":"Microsoft.Compute/disks"}]'
+        ;;
+      *)
+        emit '[{"name":"vm-orfe-relay","type":"Microsoft.Compute/virtualMachines"},{"name":"relay-pip","type":"Microsoft.Network/publicIPAddresses"}]'
+        ;;
+    esac
+    ;;
+
+  "consumption budget"*) resource_exists budget || exit 1 ;;
+
+  *)
+    # Unknown command: fail loudly rather than silently returning success, which would let
+    # a test pass while the real az call was wrong.
+    printf 'MOCK-AZ: unhandled command: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+exit 0
