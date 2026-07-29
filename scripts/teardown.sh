@@ -25,6 +25,9 @@ DRY_RUN=0
 
 usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
 
+# ASSUME_YES and DRY_RUN are read by lib/ui.sh's confirm(); shellcheck cannot see
+# through the dynamic source path. Scoped to this loop only.
+# shellcheck disable=SC2034
 while [ $# -gt 0 ]; do
   case "$1" in
     --soft)    MODE=soft ;;
