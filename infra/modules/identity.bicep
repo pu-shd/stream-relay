@@ -1,12 +1,23 @@
-// User-assigned managed identity, used by BOTH:
-//   * GitHub Actions, via a federated credential (no client secret anywhere), and
-//   * the relay VM, to pull from ACR and read the SRT passphrase from Key Vault.
+// TWO user-assigned managed identities, least privilege each.
 //
-// One identity for both is deliberate: it keeps the RBAC surface small and means a
-// teardown/redeploy cycle does not invalidate the GitHub side.
+// A single identity previously served both GitHub Actions and the VM, holding only AcrPull.
+// That was wrong in both directions: too little for CI (`az acr build` needs push and
+// task-run rights) and far too much for the VM, which sits on a public IP with an
+// internet-facing UDP listener. If that VM is compromised, its identity must not be able to
+// redeploy infrastructure or push the very image it will later execute.
+//
+//   -ci  federated to GitHub Actions. Contributor on the RG + AcrPush. No Key Vault access,
+//        so a compromised workflow cannot read the SRT passphrase.
+//   -vm  attached to the VM. AcrPull + Key Vault Secrets User. No RG rights, so a
+//        compromised VM cannot deploy anything.
+//
+// Only -ci carries federated credentials. Only -vm is attached to the VM.
 
-@description('Identity name.')
-param identityName string
+@description('Identity used by GitHub Actions via OIDC. Never attached to a VM.')
+param ciIdentityName string
+
+@description('Identity attached to the relay VM. Never federated to GitHub.')
+param vmIdentityName string
 
 @description('Azure region.')
 param location string
@@ -17,22 +28,32 @@ param githubOwner string = 'pu-orfe'
 @description('Config repository whose workflow deploys this. The federated credential subject is scoped to it.')
 param githubConfigRepo string = 'stream-relay-config'
 
-@description('Branches allowed to deploy. Enumerated explicitly - wildcard ("flexible") FIC subjects are avoided because their GA status is unconfirmed.')
+@description('Branches allowed to deploy. Enumerated explicitly - wildcard ("flexible") FIC subjects are avoided because their GA status is unconfirmed, and a wildcard subject would let any branch assume this identity.')
 param allowedBranches array = ['main']
 
-@description('GitHub Environments allowed to deploy. The production environment carries a required reviewer, so real spend needs a human click.')
+@description('GitHub Environments allowed to deploy.')
 param allowedEnvironments array = ['production']
 
-resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: identityName
+@description('Whether to create role assignments. FALSE for CI: creating role assignments needs User Access Administrator, and granting that to a workflow means a compromised workflow can grant itself anything. A human with Owner sets this true once during bootstrap.')
+param deployRoleAssignments bool = false
+
+resource ciIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: ciIdentityName
   location: location
 }
 
-// One credential per subject. GitHub sends exactly one `sub` claim per run, so each
-// branch and each environment needs its own credential.
+resource vmIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: vmIdentityName
+  location: location
+}
+
+// One credential per subject. GitHub sends exactly ONE `sub` claim per job, and the
+// environment form REPLACES the ref form rather than adding to it - so a job declaring
+// `environment: production` needs the environment credential, and a job without one needs
+// the ref credential. Both are required; neither is redundant.
 resource branchCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [
   for branch in allowedBranches: {
-    parent: identity
+    parent: ciIdentity
     name: 'gh-branch-${replace(branch, '/', '-')}'
     properties: {
       issuer: 'https://token.actions.githubusercontent.com'
@@ -44,7 +65,7 @@ resource branchCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/fed
 
 resource environmentCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [
   for env in allowedEnvironments: {
-    parent: identity
+    parent: ciIdentity
     name: 'gh-env-${env}'
     properties: {
       issuer: 'https://token.actions.githubusercontent.com'
@@ -54,7 +75,27 @@ resource environmentCredentials 'Microsoft.ManagedIdentity/userAssignedIdentitie
   }
 ]
 
-output id string = identity.id
-output principalId string = identity.properties.principalId
-output clientId string = identity.properties.clientId
-output name string = identity.name
+// Contributor on the resource group for CI: enough to converge every resource in this
+// template, and deliberately NOT User Access Administrator, so the workflow cannot alter
+// permissions - including its own.
+var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
+
+resource ciContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRoleAssignments) {
+  scope: resourceGroup()
+  name: guid(resourceGroup().id, ciIdentity.id, contributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+    principalId: ciIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+output ciId string = ciIdentity.id
+output ciPrincipalId string = ciIdentity.properties.principalId
+output ciClientId string = ciIdentity.properties.clientId
+output ciName string = ciIdentity.name
+
+output vmId string = vmIdentity.id
+output vmPrincipalId string = vmIdentity.properties.principalId
+output vmClientId string = vmIdentity.properties.clientId
+output vmName string = vmIdentity.name

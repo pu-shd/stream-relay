@@ -10,8 +10,11 @@ param keyVaultName string
 @description('Azure region.')
 param location string
 
-@description('Principal ID of the identity that may read secrets.')
+@description('Principal ID of the VM identity, the only principal that may read secrets. The CI identity deliberately has NO Key Vault access, so a compromised workflow cannot read the SRT passphrase.')
 param readerPrincipalId string
+
+@description('Whether to create role assignments (needs User Access Administrator). False for CI.')
+param deployRoleAssignments bool = false
 
 @description('Principal ID of the human/service operator that may SET secrets (bootstrap only). Empty to skip.')
 param adminPrincipalId string = ''
@@ -48,7 +51,7 @@ var secretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
 // Key Vault Secrets Officer: needed to CREATE the secret during bootstrap.
 var secretsOfficerRoleId = 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
 
-resource readerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource readerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRoleAssignments) {
   scope: vault
   name: guid(vault.id, readerPrincipalId, secretsUserRoleId)
   properties: {
@@ -58,7 +61,7 @@ resource readerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
-resource adminAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(adminPrincipalId)) {
+resource adminAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRoleAssignments && !empty(adminPrincipalId)) {
   scope: vault
   name: guid(vault.id, adminPrincipalId, secretsOfficerRoleId)
   properties: {

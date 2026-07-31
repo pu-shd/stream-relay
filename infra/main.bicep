@@ -22,8 +22,14 @@ param acrName string
 @description('Key Vault holding the SRT publish passphrase. Read by the VM\'s managed identity; never by a pipeline.')
 param keyVaultName string
 
-@description('User-assigned managed identity used for BOTH the GitHub Actions federated credential and the VM\'s ACR pull. No client secret exists anywhere.')
-param identityName string
+@description('Identity federated to GitHub Actions. Contributor on this RG + AcrPush. No Key Vault access, so a compromised workflow cannot read the SRT passphrase.')
+param ciIdentityName string
+
+@description('Identity attached to the relay VM. AcrPull + Key Vault Secrets User only, so a compromised VM (public IP, internet-facing UDP listener) cannot redeploy or push images.')
+param vmIdentityName string
+
+@description('Whether this deployment creates role assignments. Creating them needs User Access Administrator; granting that to CI would let a compromised workflow grant itself any role. A human with Owner sets this true once during bootstrap; CI always runs with false.')
+param deployRoleAssignments bool = false
 
 @description('Relay VM name.')
 param vmName string
@@ -84,8 +90,10 @@ var namePrefix = 'relay'
 module identity 'modules/identity.bicep' = {
   name: 'identity-deploy'
   params: {
-    identityName: identityName
+    ciIdentityName: ciIdentityName
+    vmIdentityName: vmIdentityName
     location: location
+    deployRoleAssignments: deployRoleAssignments
   }
 }
 
@@ -94,8 +102,9 @@ module keyVault 'modules/keyvault.bicep' = {
   params: {
     keyVaultName: keyVaultName
     location: location
-    readerPrincipalId: identity.outputs.principalId
+    readerPrincipalId: identity.outputs.vmPrincipalId
     adminPrincipalId: operatorObjectId
+    deployRoleAssignments: deployRoleAssignments
   }
 }
 
@@ -104,7 +113,9 @@ module registry 'modules/acr.bicep' = {
   params: {
     acrName: acrName
     location: location
-    pullPrincipalId: identity.outputs.principalId
+    pullPrincipalId: identity.outputs.vmPrincipalId
+    pushPrincipalId: identity.outputs.ciPrincipalId
+    deployRoleAssignments: deployRoleAssignments
   }
 }
 
@@ -130,8 +141,8 @@ module relayVm 'modules/vm.bicep' = {
     vmSize: vmSize
     subnetId: network.outputs.subnetId
     publicIpId: network.outputs.publicIpId
-    identityId: identity.outputs.id
-    identityClientId: identity.outputs.clientId
+    identityId: identity.outputs.vmId
+    identityClientId: identity.outputs.vmClientId
     acrLoginServer: registry.outputs.loginServer
     keyVaultName: keyVault.outputs.name
     passphraseSecretName: passphraseSecretName
@@ -176,8 +187,14 @@ output ingestPort int = srtPort
 output ingestUrlTemplate string = 'srt://${network.outputs.publicIpAddress}:${srtPort}?streamid=publish:<path>&passphrase=<secret>&pbkeylen=32&latency=200000'
 output acrLoginServer string = registry.outputs.loginServer
 output keyVaultName string = keyVault.outputs.name
-output identityClientId string = identity.outputs.clientId
-output identityPrincipalId string = identity.outputs.principalId
+// The CI client id is what goes into the AZURE_CLIENT_ID repository variable.
+output ciIdentityClientId string = identity.outputs.ciClientId
+output ciIdentityPrincipalId string = identity.outputs.ciPrincipalId
+output vmIdentityClientId string = identity.outputs.vmClientId
+output vmIdentityPrincipalId string = identity.outputs.vmPrincipalId
+output tenantId string = subscription().tenantId
+output subscriptionId string = subscription().subscriptionId
+output roleAssignmentsDeployed bool = deployRoleAssignments
 output vmName string = relayVm.outputs.name
 output nsgName string = network.outputs.nsgName
 output wafPolicyName string = frontDoor.outputs.wafPolicyName

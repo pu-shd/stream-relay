@@ -22,7 +22,9 @@ resource_exists() {
   case "$MOCK_AZ_SCENARIO" in
     # orphaned-disk models "everything existed, teardown ran, but a disk survived", so the
     # resources must exist or teardown exits early and never reaches the orphan check.
-    existing|orphaned-disk) return 0 ;;
+    # missing-rbac models a real RG whose identities exist but were never granted
+    # roles, so the group and identity must exist for the guard to reach the check.
+    existing|orphaned-disk|missing-rbac) return 0 ;;
     partial)
       case "$1" in
         group|identity|keyvault|acr|network) return 0 ;;
@@ -50,12 +52,30 @@ case "$1 ${2:-} ${3:-}" in
   "ad signed-in-user show"*) emit '22222222-2222-2222-2222-222222222222' ;;
 
   "role assignment list"*)
-    # The fail-closed preflight test flips this to Contributor.
-    if [ "$MOCK_AZ_SCENARIO" = "contributor-only" ]; then
+    # Two different questions come through here: the operator's own roles, and the VM
+    # identity's roles (queried by principal id to prove RBAC was established).
+    if printf '%s' "$*" | grep -q '44444444-4444-4444-4444-444444444444'; then
+      case "$MOCK_AZ_SCENARIO" in
+        # missing-rbac: the identity exists but was never granted anything, which is what
+        # a first-ever CI deploy against a never-bootstrapped RG looks like.
+        missing-rbac) emit '' ;;
+        *) emit $'Key Vault Secrets User\nAcrPull' ;;
+      esac
+    elif [ "$MOCK_AZ_SCENARIO" = "contributor-only" ]; then
       emit $'Contributor'
+    elif [ "$MOCK_AZ_SCENARIO" = "reader-only" ]; then
+      emit $'Reader'
     else
       emit $'Owner'
     fi
+    ;;
+
+  "identity show"*)
+    case "$MOCK_AZ_SCENARIO" in
+      existing|orphaned-disk|missing-rbac|contributor-only)
+        emit '44444444-4444-4444-4444-444444444444' ;;
+      *) exit 1 ;;
+    esac
     ;;
 
   "provider show "*)

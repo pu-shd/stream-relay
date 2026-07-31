@@ -104,18 +104,51 @@ do_preflight() {
     Run: az account set --subscription $AZ_SUBSCRIPTION_ID"
   fi
 
-  # Role check. Creating role assignments (for the managed identity to pull from ACR and
-  # read Key Vault) needs Owner or User Access Administrator. Contributor silently gets all
-  # the way to step 7 and then fails, so check up front.
+  # Role check, keyed to whether THIS run creates role assignments.
+  #
+  # DEPLOY_ROLE_ASSIGNMENTS=1 is the one-time human bootstrap: it creates the RBAC and so
+  # needs Owner or User Access Administrator. Everything afterwards (including every CI
+  # deploy) runs with 0 and needs only Contributor - deliberately, because a principal that
+  # can create role assignments can grant itself any role in the scope.
   local roles
   roles=$(az_query role assignment list --assignee "$user" --include-inherited \
     --query "[].roleDefinitionName" -o tsv || true)
-  if grep -qE '^(Owner|User Access Administrator)$' <<<"$roles"; then
-    ok "role permits creating role assignments"
+
+  if [ "${DEPLOY_ROLE_ASSIGNMENTS:-0}" = "1" ]; then
+    if grep -qE '^(Owner|User Access Administrator)$' <<<"$roles"; then
+      ok "role permits creating role assignments (bootstrap mode)"
+    else
+      fail "you have: $(tr '\n' ',' <<<"$roles")"
+      die "--with-role-assignments needs Owner or User Access Administrator.
+    Contributor cannot create the RBAC this template establishes."
+    fi
   else
-    fail "you have: $(tr '\n' ',' <<<"$roles")"
-    die "Owner or User Access Administrator is required to grant the managed identity
-    its ACR pull and Key Vault read roles. Contributor is not sufficient."
+    if grep -qE '^(Owner|Contributor|User Access Administrator)$' <<<"$roles"; then
+      ok "role permits deploying (no RBAC changes in this run)"
+    else
+      fail "you have: $(tr '\n' ',' <<<"$roles")"
+      die "Contributor (or higher) on the resource group is required."
+    fi
+
+    # Fail CLOSED if the RBAC this deployment depends on was never established. Otherwise
+    # a first-ever CI deploy would "succeed" and produce a VM that cannot read its own
+    # passphrase from Key Vault - a failure that surfaces much later, as a dead stream.
+    if [ "$(az_query group exists -n "${AZ_RESOURCE_GROUP:-}")" = "true" ] \
+       && exists identity show -g "$AZ_RESOURCE_GROUP" -n "${AZ_IDENTITY_VM:-}"; then
+      local vm_principal kv_roles
+      vm_principal=$(az_query identity show -g "$AZ_RESOURCE_GROUP" -n "$AZ_IDENTITY_VM" \
+        --query principalId -o tsv || true)
+      kv_roles=$(az_query role assignment list --assignee "$vm_principal" --all \
+        --query "[].roleDefinitionName" -o tsv || true)
+      if grep -q 'Key Vault Secrets User' <<<"$kv_roles"; then
+        ok "VM identity already holds Key Vault Secrets User"
+      else
+        die "the VM identity exists but has no 'Key Vault Secrets User' role.
+    RBAC was never established, so the relay would start and fail to read its passphrase.
+    Run the one-time bootstrap first:
+        scripts/bootstrap.sh --with-role-assignments"
+      fi
+    fi
   fi
 
   # Quota for the *derived* size, not a hardcoded one.
@@ -241,11 +274,17 @@ deploy_bicep() {
   local operator_oid
   operator_oid=$(az_query ad signed-in-user show --query id -o tsv || echo "")
 
+  # deployRoleAssignments defaults to false in the generated .bicepparam; only an explicit
+  # bootstrap run overrides it to true.
+  local rbac_param=()
+  [ "${DEPLOY_ROLE_ASSIGNMENTS:-0}" = "1" ] && rbac_param=(--parameters "deployRoleAssignments=true")
+
   local args=(deployment group create
     --resource-group "$AZ_RESOURCE_GROUP"
     --name "stream-relay-$(date -u +%Y%m%d%H%M%S)"
     --template-file "$REPO_ROOT/infra/main.bicep"
-    --parameters "$param_file")
+    --parameters "$param_file"
+    "${rbac_param[@]+"${rbac_param[@]}"}")
   [ -n "$operator_oid" ] && args+=(--parameters "operatorObjectId=$operator_oid")
   [ -n "${SSH_PUBLIC_KEY:-}" ] && args+=(--parameters "sshPublicKey=$SSH_PUBLIC_KEY")
 
@@ -261,6 +300,7 @@ deploy_bicep() {
       --resource-group "$AZ_RESOURCE_GROUP" \
       --template-file "$REPO_ROOT/infra/main.bicep" \
       --parameters "$param_file" \
+      "${rbac_param[@]+"${rbac_param[@]}"}" \
       ${operator_oid:+--parameters "operatorObjectId=$operator_oid"} \
       --no-pretty-print > "$REPO_ROOT/.what-if.json" 2>&1; then
       fail "what-if failed:"

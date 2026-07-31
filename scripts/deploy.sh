@@ -9,6 +9,8 @@
 #   scripts/deploy.sh --no-verify           # deploy, leave verification to a separate gate
 #   scripts/deploy.sh --dry-run --allow-rg  # create only the free, empty resource group
 #                                           # so what-if has a scope to run in
+#   scripts/deploy.sh --with-role-assignments  # ONE-TIME human bootstrap: creates RBAC,
+#                                             # needs Owner/UAA. CI never uses this.
 #   scripts/deploy.sh --list-steps
 #
 # bootstrap.sh is the interactive front end to the same steps. There is deliberately one
@@ -27,12 +29,13 @@ DRY_RUN=0
 RESUME=0
 ALLOW_RG=0
 SKIP_VERIFY=0
+DEPLOY_ROLE_ASSIGNMENTS=0
 ONLY_STEP=""
 FROM_STEP=""
 ASSUME_YES=0
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --resume)      RESUME=1 ;;
     --no-verify)   SKIP_VERIFY=1 ;;
     --allow-rg)    ALLOW_RG=1 ;;
+    --with-role-assignments) DEPLOY_ROLE_ASSIGNMENTS=1 ;;
     --step)        ONLY_STEP="${2:?--step needs a step name}"; shift ;;
     --from)        FROM_STEP="${2:?--from needs a step name}"; shift ;;
     --reset-state) RESET_STATE=1 ;;

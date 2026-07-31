@@ -32,12 +32,21 @@ trap cleanup EXIT
 setup_config() {
   local dir="$SANDBOX/stream-relay-config/orfe"
   mkdir -p "$dir"
-  cat > "$dir/deploy.env" <<'EOF'
+  # Prefer the REAL generated deploy.env when the config repo is checked out beside us: a
+  # hand-maintained fixture silently drifts from the renderer (it did, losing the split
+  # AZ_IDENTITY_CI/VM variables and making these tests assert against a shape that no
+  # longer exists).
+  local real="$REPO_ROOT/../stream-relay-config/orfe/deploy.env"
+  if [ -f "$real" ]; then
+    cp "$real" "$dir/deploy.env"
+  else
+    cat > "$dir/deploy.env" <<'EOF'
 AZ_REGION=eastus
 AZ_RESOURCE_GROUP=orfe-dept-azure-relay-rg
 AZ_ACR_NAME=acrorfestreamrelay
 AZ_KEY_VAULT=kv-orfe-relay
-AZ_IDENTITY_NAME=id-orfe-relay
+AZ_IDENTITY_CI=id-orfe-relay-ci
+AZ_IDENTITY_VM=id-orfe-relay-vm
 AZ_VM_NAME=vm-orfe-relay
 AZ_VM_SIZE=Standard_D4s_v6
 AZ_VM_VCPU=4
@@ -46,7 +55,6 @@ AZ_FRONTDOOR_ENDPOINT=orfe-relay
 AZ_NSG_NAME=relay-nsg
 RELAY_HOST=UNRESOLVED-run-deploy.sh-to-discover
 RELAY_CUSTOM_DOMAIN=
-MEDIAMTX_IMAGE=bluenviron/mediamtx:1.19.3-ffmpeg
 SRT_PORT=8890
 PBKEYLEN=32
 SRT_PASSPHRASE_SECRET=srt-publish-passphrase
@@ -60,6 +68,7 @@ PUGWIPS_REPO=PrincetonUniversity/pugwips
 PUGWIPS_STATIC_RANGES=203.0.113.0/24,198.51.100.0/24
 RELAY_PATHS=news,news-plus,undergraduate,graduate,announcements,scenic,live-events
 EOF
+  fi
   printf 'srtPublishPassphrase: ${SRT_PUBLISH_PASSPHRASE}\n' > "$dir/mediamtx.yml.tmpl"
   cp "$REPO_ROOT/../stream-relay-config/orfe/infra.bicepparam" "$dir/" 2>/dev/null \
     || printf "using '../../stream-relay/infra/main.bicep'\n" > "$dir/infra.bicepparam"
@@ -185,12 +194,54 @@ fi
 
 # --- 5. fail closed ---------------------------------------------------------------------
 step_header 7 8 "Preflight fails closed"
+# Contributor is now SUFFICIENT for a normal deploy, and that is the point: CI runs with
+# deployRoleAssignments=false so it never needs the ability to grant roles.
 reset_state; reset_log
 out=$(run_deploy contributor-only --step preflight)
-if [ $? -ne 0 ] && grep -qi "Owner or User Access Administrator" <<<"$out"; then
-  t_ok "Contributor-only is rejected up front, not at the role-assignment step"
+if [ $? -eq 0 ] && grep -q "no RBAC changes in this run" <<<"$out"; then
+  t_ok "Contributor alone can deploy (CI needs no role-assignment rights)"
 else
-  t_fail "preflight accepted insufficient permissions"
+  t_fail "Contributor was rejected for a non-RBAC deploy:\n$out"
+fi
+
+# ...but it must NOT be enough to create role assignments.
+reset_state; reset_log
+out=$(MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=contributor-only \
+  PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
+  STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
+  "$REPO_ROOT/scripts/deploy.sh" --yes --no-verify --with-role-assignments --step preflight 2>&1)
+if [ $? -ne 0 ] && grep -qi "Owner or User Access Administrator" <<<"$out"; then
+  t_ok "Contributor is rejected for --with-role-assignments (no privilege escalation)"
+else
+  t_fail "--with-role-assignments accepted a Contributor:\n$out"
+fi
+
+# Reader must fail either way.
+reset_state; reset_log
+out=$(run_deploy reader-only --step preflight)
+if [ $? -ne 0 ]; then
+  t_ok "Reader is rejected"
+else
+  t_fail "preflight accepted a Reader"
+fi
+
+# The fail-closed case that matters most: RBAC was never established, so a CI deploy would
+# otherwise "succeed" and leave a VM that cannot read its own passphrase.
+reset_state; reset_log
+out=$(run_deploy missing-rbac --step preflight)
+if [ $? -ne 0 ] && grep -q "with-role-assignments" <<<"$out"; then
+  t_ok "missing RBAC fails closed and points at the one-time bootstrap"
+else
+  t_fail "preflight did not catch missing RBAC:\n$out"
+fi
+
+# And the deploy path must never silently request role assignments.
+reset_state; reset_log
+run_deploy existing >/dev/null 2>&1
+if grep -q 'deployRoleAssignments=true' "$SANDBOX/az.log"; then
+  t_fail "a normal deploy passed deployRoleAssignments=true"
+else
+  t_ok "normal deploy never requests role-assignment creation"
 fi
 
 reset_state; reset_log
