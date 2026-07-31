@@ -17,56 +17,51 @@ single line of `page-stream`**.
 
 ## Status
 
-**Phases 0–3 built. One BLOCKER open: HLS cannot be delivered through Front Door.**
+**PROVEN END TO END against live Azure, then torn down.** Encrypted SRT from the open
+internet → MediaMTX → Blob static website → Front Door → ffprobe-decodable 1920×1080
+h264+aac, with segments served from the edge cache.
 
 | Component | State |
 | :--- | :--- |
-| Config renderer + schema (config repo) | ✅ 142 tests |
+| Config renderer + schema | ✅ 158 tests |
 | MediaMTX image + fail-closed entrypoint | ✅ verified |
-| Local stack + SRT→HLS integration test | ✅ 18 assertions |
-| Bicep (8 modules) | ✅ deployed for real; 22 resources |
-| Scripts (7) + offline `az` suite | ✅ 30 assertions |
-| Two-identity least-privilege RBAC | ✅ **verified live** |
-| Managed-identity chain (ACR pull + Key Vault read, no secrets) | ✅ **verified live** |
-| Encrypted SRT ingest from the open internet | ✅ **verified live** |
-| GitOps workflows + OIDC federation | ✅ authored; `production` environment created |
-| **HLS delivery through Front Door** | ❌ **BLOCKED — see below** |
+| Bicep (9 modules) | ✅ deployed for real, repeatedly |
+| Scripts (7) + offline `az` suite | ✅ 32 assertions |
+| Two-identity least-privilege RBAC | ✅ verified live |
+| Managed-identity chain (ACR pull, Key Vault read, Blob write) | ✅ verified live — no stored credential |
+| Encrypted SRT ingest from the internet | ✅ verified live |
+| **HLS delivery through Front Door** | ✅ **verified live** |
+| **Segment edge caching** (`x-cache: TCP_HIT`) | ✅ **verified live** |
+| Hostname stability across full teardown/redeploy | ✅ verified — same hash returned |
+| Complete teardown incl. Key Vault purge | ✅ verified — 0 resources, 0 soft-deleted vaults |
+| GitOps workflows + OIDC | ✅ authored; OIDC probe + `production` environment ready |
 | pugwips allowlist / custom domain | ❌ Phase 4 |
 | `page-stream-config --profile relay` cutover | ❌ Phase 5 |
 
-Currently torn down to standby: **~$9/month** (ACR Basic ~$5 + static ingest IP ~$3.65).
-The whole live exercise cost about **$0.40**.
+Currently **$0/month** — nothing deployed. The whole verification exercise cost about $2.
 
-### BLOCKER: MediaMTX's HLS server cannot sit behind a CDN
+### The evidence
 
-Verified against the live deployment, not inferred:
+```
+ffprobe via Front Door      h264, 1920x1080  +  aac
+segment request 1           x-cache: TCP_MISS   cache-control: public, max-age=60
+segment request 2           x-cache: TCP_HIT    (349,868 bytes from the edge)
+?session=aaaa vs bbbb       one cache key
+origin 8888                 not reachable from the internet
+```
 
-- `GET /<path>/index.m3u8` **302-redirects** to `?cookieCheck=1`
-- the response sets **`Cache-Control: private, no-cache`**, so Front Door answers
-  **`X-Cache: PRIVATE_NOSTORE`** — and Front Door *always* honours `private`/`no-cache`, so
-  no rules-engine override can make it cacheable
-- the variant playlist returns **401 through the CDN even with a cookie jar**, because
-  delivery is gated on a per-viewer session
+Segments are ~99% of the bytes and cache for 60s, so origin egress collapses to roughly one
+fill per POP rather than one per viewer — which is what makes the ~$603/mo activated estimate
+hold. Manifests miss by design (rewritten every 4s, ~2s TTL) and that is expected: `verify.sh`
+asserts caching on **segments**, because asserting it on manifests would fail forever while
+saying nothing about cost.
 
-So this is not "caching is inefficient". HLS **does not work** behind Front Door as built.
-Two consequences: the `IgnoreSpecifiedQueryStrings` rule is ineffective for manifests, and
-the ~$603/mo activated estimate assumed cache hits that cannot occur.
+### Why the ingest tier is a VM
 
-**The fix is a topology change, not a setting.** MediaMTX's `hlsDirectory` writes segments to
-disk; serve those as static files and its session layer is bypassed entirely:
-
-| Option | Delivery | Trade-off |
-| :--- | :--- | :--- |
-| nginx/Caddy on the same VM | static files behind Front Door | smallest change; restores cacheability |
-| **Blob Storage static website + Front Door** | serverless | best: origin egress ≈ one fill per POP; VM does ingest only |
-| No CDN — TVs hit the VM directly | MediaMTX as-is | cheapest (−$35/mo); loses TLS, custom domain, DDoS protection |
-
-### Why the ingest tier must stay a VM
-
-SRT is UDP. App Service and Container Apps are HTTP/TCP-only and cannot accept it at all.
-Container Instances can expose UDP and would remove OS management, but costs more running
-24/7 and gives up the restart/health control this design relies on. **Delivery**, by contrast,
-needs no VM — which is exactly what the fix above exploits.
+SRT is UDP. App Service and Container Apps are HTTP/TCP-only and cannot accept it. Container
+Instances can expose UDP and would remove OS management, at higher 24/7 cost and with less
+control over restart/health. **Delivery** needs no VM at all — that is exactly what the Blob
+topology exploits.
 
 ## Contents
 
