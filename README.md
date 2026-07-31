@@ -17,43 +17,58 @@ single line of `page-stream`**.
 
 ## Status
 
-**Phases 0–2 complete. Phases 3–5 designed but not implemented.** This table is the honest
-picture of what exists today; everything else below is documented as designed.
+**Phases 0–3 built. One BLOCKER open: HLS cannot be delivered through Front Door.**
 
 | Component | State |
 | :--- | :--- |
-| `relay.yml` schema + `render-relay.py` (config repo) | ✅ 103 tests passing |
-| MediaMTX image + fail-closed entrypoint | ✅ verified against a real MediaMTX |
-| Local stack (`docker-compose.local.yml`) | ✅ verified |
-| Integration test: encrypted SRT → HLS → ffprobe | ✅ 18 assertions passing |
-| `infra/main.bicep` + 7 modules | ✅ compiles; 22 resource creations validated by what-if |
-| `scripts/{bootstrap,deploy,update,teardown,restrict,allow-all,verify}.sh` | ✅ written, bash 3.2-safe |
-| `tests/mock-az/` | ✅ 25 assertions passing (offline) |
-| **Behaviour of the deployed service** | ⚠️ **UNPROVEN — needs a real deploy** |
-| GitOps deploy workflow + OIDC | ❌ Phase 3 |
-| pugwips module | ❌ Phase 4 |
-| `page-stream-config --profile relay` cutover flag | ❌ Phase 5 |
+| Config renderer + schema (config repo) | ✅ 142 tests |
+| MediaMTX image + fail-closed entrypoint | ✅ verified |
+| Local stack + SRT→HLS integration test | ✅ 18 assertions |
+| Bicep (8 modules) | ✅ deployed for real; 22 resources |
+| Scripts (7) + offline `az` suite | ✅ 30 assertions |
+| Two-identity least-privilege RBAC | ✅ **verified live** |
+| Managed-identity chain (ACR pull + Key Vault read, no secrets) | ✅ **verified live** |
+| Encrypted SRT ingest from the open internet | ✅ **verified live** |
+| GitOps workflows + OIDC federation | ✅ authored; `production` environment created |
+| **HLS delivery through Front Door** | ❌ **BLOCKED — see below** |
+| pugwips allowlist / custom domain | ❌ Phase 4 |
+| `page-stream-config --profile relay` cutover | ❌ Phase 5 |
 
-**No billable Azure resource has ever been created. Cost to date: $0.** An empty resource group
-(`orfe-dept-azure-relay-rg`) exists in `ORFE-dept-azure` so that `what-if` has a scope to run in;
-resource groups are free and it holds nothing. Remove it any time with
-`az group delete -n orfe-dept-azure-relay-rg --yes`.
+Currently torn down to standby: **~$9/month** (ACR Basic ~$5 + static ingest IP ~$3.65).
+The whole live exercise cost about **$0.40**.
 
-### What "Phase 2 complete" does not mean
+### BLOCKER: MediaMTX's HLS server cannot sit behind a CDN
 
-`what-if` validates the *shape* of a deployment, not its *behaviour*. Two of the most expensive
-things in this design remain unverified until someone actually deploys:
+Verified against the live deployment, not inferred:
 
-- whether the cache rule really collapses the `?session=` key (get it wrong and egress roughly
-  doubles);
-- whether the Front Door hostname survives a teardown/redeploy cycle.
+- `GET /<path>/index.m3u8` **302-redirects** to `?cookieCheck=1`
+- the response sets **`Cache-Control: private, no-cache`**, so Front Door answers
+  **`X-Cache: PRIVATE_NOSTORE`** — and Front Door *always* honours `private`/`no-cache`, so
+  no rules-engine override can make it cacheable
+- the variant playlist returns **401 through the CDN even with a cookie jar**, because
+  delivery is gated on a per-viewer session
 
-`scripts/verify.sh` asserts both, but it needs a live endpoint. Also note that what-if happily
-evaluated `Microsoft.Cdn` resources while that provider was still **NotRegistered** on the
-subscription — so what-if would not have caught a real blocker, which is exactly why
-`preflight` and `register-providers` are separate steps.
+So this is not "caching is inefficient". HLS **does not work** behind Front Door as built.
+Two consequences: the `IgnoreSpecifiedQueryStrings` rule is ineffective for manifests, and
+the ~$603/mo activated estimate assumed cache hits that cannot occur.
 
-## Contents
+**The fix is a topology change, not a setting.** MediaMTX's `hlsDirectory` writes segments to
+disk; serve those as static files and its session layer is bypassed entirely:
+
+| Option | Delivery | Trade-off |
+| :--- | :--- | :--- |
+| nginx/Caddy on the same VM | static files behind Front Door | smallest change; restores cacheability |
+| **Blob Storage static website + Front Door** | serverless | best: origin egress ≈ one fill per POP; VM does ingest only |
+| No CDN — TVs hit the VM directly | MediaMTX as-is | cheapest (−$35/mo); loses TLS, custom domain, DDoS protection |
+
+### Why the ingest tier must stay a VM
+
+SRT is UDP. App Service and Container Apps are HTTP/TCP-only and cannot accept it at all.
+Container Instances can expose UDP and would remove OS management, but costs more running
+24/7 and gives up the restart/health control this design relies on. **Delivery**, by contrast,
+needs no VM — which is exactly what the fix above exploits.
+
+## Contents## Contents
 
 - [Why MediaMTX (and not YouTube)](#why-mediamtx-and-not-youtube)
 - [Why Azure](#why-azure)
