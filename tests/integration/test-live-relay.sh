@@ -93,7 +93,7 @@ step_header 3 5 "Waiting for the stream to appear through the CDN"
 # Front Door needs a moment on first request per POP, plus MediaMTX's segment buildup.
 appeared=0
 for _ in $(seq 1 24); do
-  if curl -fsS --max-time 15 "https://$HOST/$PUB_PATH/index.m3u8" 2>/dev/null | grep -q '#EXTM3U'; then
+  if curl -fsSL --max-time 15 "https://$HOST/$PUB_PATH/index.m3u8" 2>/dev/null | grep -q '#EXTM3U'; then
     appeared=1; break
   fi
   sleep 5
@@ -117,7 +117,7 @@ fi
 step_header 5 5 "Full verification (cache rules now testable)"
 # With a live publisher, verify.sh's cache-hit and session-key assertions actually run
 # instead of skipping - which is the entire reason this script exists.
-if "$REPO_ROOT/scripts/verify.sh" --dept "$DEPT"; then
+if "$REPO_ROOT/scripts/verify.sh" --dept "$DEPT" --require-live; then
   t_ok "verify.sh passed with a live channel"
 else
   t_fail "verify.sh reported failures (see above)"

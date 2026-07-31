@@ -27,6 +27,7 @@ EXPECT_HOSTNAME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-hostname) EXPECT_HOSTNAME="${2:?}"; shift ;;
+    --require-live) REQUIRE_LIVE=1 ;;
     --dept) DEPT="${2:?}"; DEPT_DIR="$CONFIG_REPO/$DEPT"; shift ;;
     -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -43,7 +44,7 @@ set +a
 # shellcheck source=lib/state.sh
 source "$REPO_ROOT/scripts/lib/state.sh"
 
-pass=0; failed=0
+pass=0; failed=0; unverified=0
 check_ok()   { ok "$1"; pass=$(( pass + 1 )); }
 check_fail() { fail "$1"; failed=$(( failed + 1 )); }
 
@@ -84,7 +85,7 @@ step_header 3 6 "Channel manifests"
 IFS=',' read -ra paths <<< "${RELAY_PATHS:-}"
 served=0
 for p in "${paths[@]}"; do
-  body=$(curl -s --max-time 20 "https://$HOST/$p/index.m3u8" || true)
+  body=$(curl -sL --max-time 20 "https://$HOST/$p/index.m3u8" || true)
   if grep -q '#EXTM3U' <<<"$body"; then
     check_ok "$p serves a manifest"
     served=$(( served + 1 ))
@@ -94,8 +95,16 @@ for p in "${paths[@]}"; do
     skipped "$p has no publisher (expected when page-stream is not pointed here yet)"
   fi
 done
-[ "$served" -gt 0 ] && check_ok "$served/${#paths[@]} channels live" \
-  || warn "no channels are publishing — start page-stream in relay mode to test fully"
+if [ "$served" -gt 0 ]; then
+  check_ok "$served/${#paths[@]} channels live"
+elif [ "${REQUIRE_LIVE:-0}" = "1" ]; then
+  # --require-live is used by the live test and the rehearsal drill, where a publisher IS
+  # running, so zero live channels is a hard failure rather than a shrug.
+  check_fail "no channels are serving, but --require-live was set"
+else
+  warn "no channels are publishing — start page-stream in relay mode to test fully"
+  unverified=$(( unverified + 1 ))
+fi
 
 # --- 4. the cache rule ------------------------------------------------------------------
 step_header 4 6 "Cache behaviour (the expensive one)"
@@ -105,7 +114,12 @@ if [ -n "${FIRST_SERVED:-}" ]; then
   sleep 1
   hdrs=$(curl -s -D - -o /dev/null --max-time 20 "$url" || true)
   xcache=$(grep -i '^x-cache:' <<<"$hdrs" | tr -d '\r' | head -1)
-  if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$hdrs"; then
+  if grep -qi 'PRIVATE_NOSTORE\|private' <<<"$hdrs"; then
+    # MediaMTX's own HLS server sends "Cache-Control: private, no-cache" and gates playlists
+    # behind a per-viewer session cookie. Front Door ALWAYS honours private/no-cache, so no
+    # rule can make this cacheable: every client byte also costs an origin byte.
+    check_fail "origin marks the manifest UNCACHEABLE (${xcache:-private}) — Front Door cannot cache it, so egress roughly doubles. Serve HLS from hlsDirectory via a static server instead of MediaMTX's HTTP layer."
+  elif grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$hdrs"; then
     check_ok "second request was a cache HIT (${xcache:-x-cache present})"
   else
     check_fail "no cache hit (${xcache:-no X-Cache header}) — the session query-string rule may be missing; origin egress will roughly double"
@@ -129,7 +143,12 @@ if [ -n "${FIRST_SERVED:-}" ]; then
   fi
 else
   skipped "no live channel, so cache behaviour cannot be asserted"
-  warn "cache correctness is UNVERIFIED — re-run with a publisher active"
+  if [ "${REQUIRE_LIVE:-0}" = "1" ]; then
+    check_fail "cache behaviour unverified while --require-live was set"
+  else
+    warn "cache correctness is UNVERIFIED — re-run with a publisher active"
+    unverified=$(( unverified + 3 ))
+  fi
 fi
 
 # --- 5. control surfaces must not be exposed --------------------------------------------
@@ -169,9 +188,16 @@ fi
 
 printf "\n"
 banner "VERIFICATION SUMMARY"
-if [ "$failed" -eq 0 ]; then
+if [ "$failed" -eq 0 ] && [ "$unverified" -eq 0 ]; then
   printf "${GREEN}${BOLD}✓ %d checks passed.${NC}\n" "$pass"
   exit 0
+fi
+if [ "$failed" -eq 0 ]; then
+  # Not a pass. An unverified cache rule is the difference between $603/mo and $850/mo.
+  printf "${YELLOW}${BOLD}⚠ %d passed, %d UNVERIFIED, 0 failed.${NC}\n" "$pass" "$unverified"
+  printf "${YELLOW}Unverified is not verified. Re-run with a publisher active:${NC}\n"
+  printf "  tests/integration/test-live-relay.sh\n"
+  exit 2
 fi
 printf "${RED}${BOLD}✗ %d failed, %d passed.${NC}\n" "$failed" "$pass"
 exit 1

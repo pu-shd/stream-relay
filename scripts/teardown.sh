@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # teardown.sh — return the relay to standby, or delete it entirely.
 #
-#   scripts/teardown.sh --soft    # delete VM + Front Door, keep ACR/KV/identity (~$5/mo)
+#   scripts/teardown.sh --soft    # delete VM + Front Door; keep ACR/KV/identity AND the
+#                                 # static ingest IP so publishers survive (~$9/mo)
 #   scripts/teardown.sh --hard    # delete the whole resource group
 #
 # This script is load-bearing, not an afterthought. The entire cost model depends on the
-# relay actually going away: standby is ~$5/mo, activated is ~$603/mo. A teardown that
+# relay actually going away: standby is ~$9/mo, activated is several hundred/mo. A teardown that
 # quietly leaves a VM running turns a fallback into a subscription.
 #
 # --soft is the default posture after a rehearsal drill. It keeps the image in ACR (so the
@@ -94,7 +95,9 @@ confirm "Delete the VM and Front Door, keeping ACR / Key Vault / identity?" || d
 
 step_header 1 5 "Front Door"
 if az afd profile show -g "$AZ_RESOURCE_GROUP" --profile-name "$AZ_FRONTDOOR_PROFILE" >/dev/null 2>&1; then
-  run afd profile delete -g "$AZ_RESOURCE_GROUP" --profile-name "$AZ_FRONTDOOR_PROFILE" --yes
+  # NOTE: `az afd profile delete` has no --yes flag; it does not prompt. Passing --yes
+  # fails with 'unrecognized arguments'.
+  run afd profile delete -g "$AZ_RESOURCE_GROUP" --profile-name "$AZ_FRONTDOOR_PROFILE"
   ok "deleted $AZ_FRONTDOOR_PROFILE"
 else
   skipped "no Front Door profile"
@@ -118,20 +121,26 @@ else
 fi
 
 step_header 4 5 "Network"
-for res in "relay-nsg:network nsg" "relay-pip:network public-ip" "relay-vnet:network vnet"; do
-  name="${res%%:*}"; cmd="${res#*:}"
-  # shellcheck disable=SC2086
-  if az $cmd show -g "$AZ_RESOURCE_GROUP" -n "$name" >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    run $cmd delete -g "$AZ_RESOURCE_GROUP" -n "$name" && ok "deleted $name" \
-      || warn "could not delete $name (a dependency may still reference it)"
-  else
-    skipped "no $name"
-  fi
-done
+# ORDER MATTERS, and the NIC must go FIRST: deleting the vnet while a NIC still holds an
+# ipConfiguration in its subnet fails with InUseSubnetCannotBeDeleted.
 if az network nic show -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME}-nic" >/dev/null 2>&1; then
-  run network nic delete -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME}-nic" && ok "deleted NIC"
+  run network nic delete -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME}-nic" && ok "deleted NIC" \
+    || warn "could not delete the NIC"
+else
+  skipped "no NIC"
 fi
+
+# The STATIC PUBLIC IP IS DELIBERATELY KEPT.
+#
+# It costs about $3.65/month, and that is the price of a stable ingest address. Every
+# page-stream producer embeds this IP in its SRT URL, so releasing it means the next
+# activation comes up on a different address and every publisher silently breaks - exactly
+# the failure the Front Door hostname hash-reuse setting exists to prevent, one layer down.
+#
+# The vnet and NSG are free and are kept for the same reason (and because keeping them
+# avoids the subnet-dependency dance entirely).
+skipped "keeping relay-pip, relay-vnet and relay-nsg so the ingest address stays stable"
+info "static public IP: ~\$3.65/mo — the cost of publishers not breaking on reactivation"
 
 step_header 5 5 "Survivors"
 printf "\n${BOLD}Still present (intentionally, for fast reactivation):${NC}\n"
@@ -139,8 +148,10 @@ az resource list -g "$AZ_RESOURCE_GROUP" --query "[].{name:name, type:type}" -o 
 
 # Report anything unexpected rather than assuming success. An orphaned disk or public IP is
 # a silent monthly charge, and this is exactly where it would hide.
+# Disks and VMs are the hourly costs that must not survive. The public IP is retained on
+# purpose (see above), so it is not an orphan.
 unexpected=$(az resource list -g "$AZ_RESOURCE_GROUP" \
-  --query "[?type=='Microsoft.Compute/disks' || type=='Microsoft.Network/publicIPAddresses' || type=='Microsoft.Compute/virtualMachines'].name" -o tsv)
+  --query "[?type=='Microsoft.Compute/disks' || type=='Microsoft.Compute/virtualMachines' || type=='Microsoft.Network/networkInterfaces'].name" -o tsv)
 printf "\n"
 if [ -n "$unexpected" ]; then
   warn "these should have been removed by --soft and are still billable:"
@@ -148,5 +159,5 @@ if [ -n "$unexpected" ]; then
   exit 1
 fi
 ok "no billable compute or IP resources remain"
-ok "standby cost is now approximately \$5/month (ACR Basic)"
+ok "standby cost is now approximately \$9/month (ACR Basic ~\$5 + static IP ~\$3.65)"
 info "reactivate with: scripts/bootstrap.sh --resume"

@@ -288,16 +288,26 @@ rc=$?
 
 fd_line=$(grep -n 'afd profile delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
 vm_line=$(grep -n 'vm delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
-net_line=$(grep -n 'network vnet delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
+nic_line=$(grep -n 'network nic delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
 if [ -n "$fd_line" ] && [ -n "$vm_line" ] && [ "$fd_line" -lt "$vm_line" ]; then
   t_ok "Front Door deleted before the VM"
 else
   t_fail "teardown order wrong: front-door=$fd_line vm=$vm_line"
 fi
-if [ -n "$vm_line" ] && [ -n "$net_line" ] && [ "$vm_line" -lt "$net_line" ]; then
-  t_ok "VM deleted before its network"
+# The NIC must be deleted AFTER the VM and BEFORE any subnet work, or Azure rejects it
+# with InUseSubnetCannotBeDeleted.
+if [ -n "$vm_line" ] && [ -n "$nic_line" ] && [ "$vm_line" -lt "$nic_line" ]; then
+  t_ok "VM deleted before its NIC"
 else
-  t_fail "teardown order wrong: vm=$vm_line network=$net_line"
+  t_fail "teardown order wrong: vm=$vm_line nic=$nic_line"
+fi
+
+# The static public IP and the vnet must SURVIVE --soft: publishers embed that IP, so
+# releasing it breaks every producer on the next activation.
+if grep -qE 'network public-ip delete|network vnet delete' "$SANDBOX/az.log"; then
+  t_fail "--soft deleted the public IP or vnet; the ingest address must stay stable"
+else
+  t_ok "--soft kept the static ingest IP and vnet (stable publisher address)"
 fi
 if grep -qE '(acr delete|keyvault delete|identity delete)' "$SANDBOX/az.log"; then
   t_fail "--soft deleted ACR/KeyVault/identity, which it must preserve"

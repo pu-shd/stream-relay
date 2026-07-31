@@ -151,7 +151,14 @@ case "$1 ${2:-} ${3:-}" in
     ;;
 
   "afd profile show"*) resource_exists frontdoor || exit 1 ;;
-  "afd profile delete"*) ;;
+  "afd profile delete"*)
+    # The real CLI has no --yes for this command and errors with "unrecognized arguments".
+    # The mock previously accepted anything, which let that bug reach a live teardown.
+    if printf '%s' "$*" | grep -q -- '--yes'; then
+      printf "MOCK-AZ: 'az afd profile delete' does not accept --yes\n" >&2
+      exit 2
+    fi
+    ;;
 
   "vm show"*) resource_exists vm || exit 1 ;;
   "vm delete"*) ;;
