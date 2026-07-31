@@ -332,14 +332,51 @@ before any spend.
 
 ## Security model
 
-**No secrets in any cloud deployment pipeline.**
+**No secrets in any cloud deployment pipeline**, and **two identities** so that no single
+compromise reaches both the infrastructure and the credential.
+
+| Identity | Used by | Roles | Cannot |
+| :--- | :--- | :--- | :--- |
+| `id-orfe-relay-ci` | GitHub Actions (federated) | `Contributor` on the RG, `AcrPush` | read the SRT passphrase; **grant any role** |
+| `id-orfe-relay-vm` | the relay VM | `AcrPull`, `Key Vault Secrets User` | deploy anything; push images |
+
+Why two, and not one: a single identity would be simultaneously too weak for CI (`az acr
+build` needs push and task-run rights, so `AcrPull` alone fails at the build step) and far
+too strong for the VM, which sits on a public IP with an internet-facing UDP listener. If
+that VM is compromised, its identity must not be able to redeploy the infrastructure or push
+the very image it will later execute.
 
 | Hop | Mechanism | Secret stored? |
 | :--- | :--- | :--- |
-| GitHub Actions → Azure | User-assigned managed identity + federated credential; `azure/login@v2` with `client-id`/`tenant-id`/`subscription-id` in **`vars`** | none |
-| VM → ACR | Same UAMI + `Container Registry Repository Reader` (ABAC registries) or `AcrPull`; `az login --identity` → `az acr login` | none |
-| VM → SRT passphrase | **Key Vault**, read at boot by the VM's managed identity | in Key Vault only |
+| GitHub Actions → Azure | `-ci` identity + federated credential; `azure/login@v2` with the three IDs in **`vars`** | none |
+| VM → ACR | `-vm` identity; `az login --identity` → `az acr login`, refreshed by a systemd timer | none |
+| VM → SRT passphrase | **Key Vault**, read at boot by the `-vm` identity | in Key Vault only |
 | `page-stream` → relay | Publisher-side passphrase from the config repo's existing repository secrets | pre-existing |
+
+### CI cannot escalate its own privileges
+
+`main.bicep` creates role assignments, and creating those requires **User Access
+Administrator** — which would let a compromised workflow grant itself any role in the
+resource group. So RBAC creation is gated:
+
+| Runner | Flag | Needs | Creates RBAC? |
+| :--- | :--- | :--- | :--- |
+| Human bootstrap, once | `--with-role-assignments` | Owner / UAA | yes |
+| CI, every deploy after | *(default)* | **Contributor only** | no |
+
+Role assignments do not change between deploys, so this costs nothing in convenience.
+`preflight` fails **closed** if the VM identity exists without `Key Vault Secrets User` —
+otherwise a first-ever CI deploy would report success and leave a relay unable to read its own
+passphrase, a fault that surfaces much later as a dead stream.
+
+### The `production` environment gate is not separation of duties
+
+`deploy.yml` gates the billable job on a GitHub environment with a required reviewer. With a
+**single reviewer who is also the person dispatching the workflow** — and with
+`can_admins_bypass: true` — that gate is a confirmation prompt and an audit trail, not a
+control. It is documented here so nobody later mistakes it for one. Its other purpose is
+real: the OIDC subject becomes `repo:…:environment:production`, which is a distinct federated
+credential from the branch subject.
 
 Notes:
 
