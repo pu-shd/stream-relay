@@ -108,38 +108,64 @@ fi
 
 # --- 4. the cache rule ------------------------------------------------------------------
 step_header 4 6 "Cache behaviour (the expensive one)"
+# SEGMENTS are what this asserts, not manifests.
+#
+# Manifests are rewritten every segment duration and carry a ~2s TTL, so they are
+# near-uncacheable BY DESIGN and a miss on them is expected. Segments are immutable once
+# written and are ~99% of the bytes, so segment cache behaviour is what decides whether the
+# activated bill is ~$420/mo of egress or roughly double that. Asserting the manifest
+# instead would fail permanently while telling you nothing about cost.
 if [ -n "${FIRST_SERVED:-}" ]; then
   url="https://$HOST/$FIRST_SERVED/index.m3u8"
-  curl -s -o /dev/null --max-time 20 "$url" || true
-  sleep 1
-  hdrs=$(curl -s -D - -o /dev/null --max-time 20 "$url" || true)
-  xcache=$(grep -i '^x-cache:' <<<"$hdrs" | tr -d '\r' | head -1)
-  if grep -qi 'PRIVATE_NOSTORE\|private' <<<"$hdrs"; then
-    # MediaMTX's own HLS server sends "Cache-Control: private, no-cache" and gates playlists
-    # behind a per-viewer session cookie. Front Door ALWAYS honours private/no-cache, so no
-    # rule can make this cacheable: every client byte also costs an origin byte.
-    check_fail "origin marks the manifest UNCACHEABLE (${xcache:-private}) — Front Door cannot cache it, so egress roughly doubles. Serve HLS from hlsDirectory via a static server instead of MediaMTX's HTTP layer."
-  elif grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$hdrs"; then
-    check_ok "second request was a cache HIT (${xcache:-x-cache present})"
+
+  # The origin must not mark content uncacheable. MediaMTX's own HLS server sent
+  # "private, no-cache" and gated playlists behind a per-viewer session, which no
+  # rules-engine override can undo - that is why delivery moved to static files.
+  mhdrs=$(curl -s -D - -o /dev/null -L --max-time 20 "$url" || true)
+  if grep -qiE 'cache-control:.*(private|no-store)' <<<"$mhdrs"; then
+    check_fail "origin marks content UNCACHEABLE — Front Door cannot cache it, so egress roughly doubles"
   else
-    check_fail "no cache hit (${xcache:-no X-Cache header}) — the session query-string rule may be missing; origin egress will roughly double"
+    check_ok "origin allows caching ($(grep -i '^cache-control:' <<<"$mhdrs" | tr -d '\r' | head -1))"
   fi
 
-  # A per-session query string must NOT split the cache key.
-  curl -s -o /dev/null --max-time 20 "${url}?session=aaaa" || true   # prime
-  s2=$(curl -s -D - -o /dev/null --max-time 20 "${url}?session=bbbb" || true)
-  if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$s2"; then
-    check_ok "differing ?session values share one cache key"
-  else
-    check_fail "?session=bbbb missed after ?session=aaaa — IgnoreSpecifiedQueryStrings is not in effect"
-  fi
+  variant=$(curl -sL --max-time 20 "$url" | grep -v '^#' | grep 'm3u8' | head -1 || true)
+  segment=""
+  [ -n "$variant" ] && segment=$(curl -sL --max-time 20 "https://$HOST/$FIRST_SERVED/$variant" \
+    | grep -v '^#' | grep -E '\.ts|\.m4s|\.mp4' | head -1 || true)
 
-  # Explicit TTL, not Front Door's random 1-3 day default.
-  cc=$(grep -i '^cache-control:' <<<"$hdrs" | tr -d '\r' || true)
-  if grep -qiE 'max-age=([0-9]|[1-5][0-9])\b' <<<"$cc"; then
-    check_ok "manifest carries a short explicit TTL ($cc)"
+  if [ -n "$segment" ]; then
+    segurl="https://$HOST/$FIRST_SERVED/$segment"
+    curl -s -o /dev/null -L --max-time 25 "$segurl" || true   # prime the edge
+    sleep 3
+    shdrs=$(curl -s -D - -o /dev/null -L --max-time 25 "$segurl" || true)
+    xc=$(grep -i '^x-cache:' <<<"$shdrs" | tr -d '\r' | head -1)
+    if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$shdrs"; then
+      check_ok "SEGMENT served from the edge cache (${xc:-hit}) — origin egress collapses to ~1 fill per POP"
+    else
+      check_fail "segment was not a cache hit (${xc:-no X-Cache}); every viewer byte would also cost an origin byte"
+    fi
+
+    if grep -qiE 'cache-control:.*max-age=([6-9][0-9]|[1-9][0-9]{2,})' <<<"$shdrs"; then
+      check_ok "segment TTL is long enough to be worth caching ($(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1))"
+    else
+      check_fail "segment TTL too short to cache usefully: $(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1)"
+    fi
+
+    # A per-viewer query string must not split the cache key.
+    curl -s -o /dev/null -L --max-time 25 "${segurl}?session=aaaa" || true
+    s2=$(curl -s -D - -o /dev/null -L --max-time 25 "${segurl}?session=bbbb" || true)
+    if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$s2"; then
+      check_ok "differing ?session values share one cache key"
+    else
+      check_fail "?session split the cache key — IgnoreSpecifiedQueryStrings is not in effect"
+    fi
   else
-    check_fail "manifest TTL looks wrong (${cc:-none}) — a random multi-day TTL would freeze the displays"
+    skipped "no segment listed yet (stream may still be filling)"
+    if [ "${REQUIRE_LIVE:-0}" = "1" ]; then
+      check_fail "no segment available to test caching while --require-live was set"
+    else
+      unverified=$(( unverified + 3 ))
+    fi
   fi
 else
   skipped "no live channel, so cache behaviour cannot be asserted"

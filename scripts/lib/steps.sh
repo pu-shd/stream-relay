@@ -329,15 +329,32 @@ deploy_bicep() {
   # Azure Run Command (RBAC-gated), or delete-and-redeploy - the VM is disposable by design:
   # its config comes from the config repo and its secret from Key Vault.
   if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
-    local ephemeral_key
-    ephemeral_key=$(mktemp -u)
-    ssh-keygen -t ed25519 -N '' -C 'stream-relay-ephemeral-discarded' -f "$ephemeral_key" >/dev/null 2>&1
-    SSH_PUBLIC_KEY=$(cat "${ephemeral_key}.pub")
-    shred -u "$ephemeral_key" 2>/dev/null || rm -f "$ephemeral_key"
-    rm -f "${ephemeral_key}.pub"
-    info "generated an ephemeral SSH key and discarded the private half"
-    detail "Azure requires some Linux auth method; the NSG exposes no SSH port."
-    detail "Set SSH_PUBLIC_KEY to keep a break-glass path instead."
+    # The key must be STABLE across deployments. Azure rejects any change to
+    # linuxConfiguration.ssh.publicKeys on an existing VM (PropertyChangeNotAllowed), so
+    # generating a fresh ephemeral key each run made every redeploy fail against a live VM.
+    # Order: reuse what the state file recorded, else read it back off the running VM, else
+    # generate one.
+    SSH_PUBLIC_KEY=$(state_get_output sshPublicKey || true)
+
+    if [ -z "$SSH_PUBLIC_KEY" ] && [ "$(az_query group exists -n "${AZ_RESOURCE_GROUP:-}")" = "true" ]; then
+      SSH_PUBLIC_KEY=$(az_query vm show -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME:-}" \
+        --query "osProfile.linuxConfiguration.ssh.publicKeys[0].keyData" -o tsv || true)
+      [ -n "$SSH_PUBLIC_KEY" ] && info "reusing the existing VM's SSH key (Azure forbids changing it)"
+    fi
+
+    if [ -z "$SSH_PUBLIC_KEY" ]; then
+      local ephemeral_key
+      ephemeral_key=$(mktemp -u)
+      ssh-keygen -t ed25519 -N '' -C 'stream-relay-ephemeral-discarded' -f "$ephemeral_key" >/dev/null 2>&1
+      SSH_PUBLIC_KEY=$(cat "${ephemeral_key}.pub")
+      shred -u "$ephemeral_key" 2>/dev/null || rm -f "$ephemeral_key"
+      rm -f "${ephemeral_key}.pub"
+      info "generated an ephemeral SSH key and discarded the private half"
+      detail "Azure requires some Linux auth method; the NSG exposes no SSH port."
+      detail "Set SSH_PUBLIC_KEY to keep a break-glass path instead."
+    fi
+    # Record it so the next deploy presents the SAME key rather than a new one.
+    state_record_output sshPublicKey "$SSH_PUBLIC_KEY"
   fi
 
   # deployRoleAssignments defaults to false in the generated .bicepparam; only an explicit
@@ -391,8 +408,14 @@ deploy_bicep() {
     return 0
   fi
 
-  local out
-  if ! out=$(az "${args[@]}" -o json 2>&1); then
+  local out err_file
+  err_file=$(mktemp)
+  # stdout and stderr are captured SEPARATELY. Merging them (2>&1) meant Bicep's
+  # "WARNING: A new Bicep release is available" lines landed inside the JSON, so every
+  # `jq` read of the deployment outputs failed silently and nothing was recorded - which
+  # surfaced much later as "no ingest IP in state".
+  if ! out=$(az "${args[@]}" -o json 2>"$err_file"); then
+    out="$out$(cat "$err_file")"
     # Azure refuses to change cloud-init on an existing VM:
     #   PropertyChangeNotAllowed: Changing property 'osProfile.customData' is not allowed.
     # Any edit to the cloud-init block therefore requires REPLACING the VM. That is cheap
@@ -407,9 +430,12 @@ deploy_bicep() {
       die "refusing to delete a running VM implicitly"
     fi
     printf '%s\n' "$out" | tail -20 >&2
+    rm -f "$err_file"
     die "bicep deployment failed"
   fi
-  for key in frontDoorHostName ingestIpAddress acrLoginServer keyVaultName identityClientId; do
+  rm -f "$err_file"
+  for key in frontDoorHostName ingestIpAddress acrLoginServer keyVaultName \
+             ciIdentityClientId vmIdentityClientId storageAccountName staticWebsiteHostName; do
     local v
     v=$(jq -r --arg k "$key" '.properties.outputs[$k].value // empty' <<<"$out")
     [ -n "$v" ] && state_record_output "$key" "$v"
