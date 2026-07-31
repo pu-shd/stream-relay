@@ -34,6 +34,15 @@ param keyVaultName string
 @description('Key Vault secret name for the SRT passphrase.')
 param passphraseSecretName string
 
+@description('Storage account that serves HLS. The VM mirrors hlsDirectory into its $web container; MediaMTX no longer serves HTTP to anyone.')
+param storageAccountName string
+
+@description('Local directory MediaMTX writes HLS into, mirrored to Blob.')
+param hlsDirectory string = '/var/lib/stream-relay/hls'
+
+@description('Blob service endpoint of the delivery account, passed in rather than built from a hardcoded suffix so this works in sovereign clouds.')
+param storageBlobEndpoint string
+
 @description('Admin username. No password and no SSH key are configured - see below.')
 param adminUsername string = 'relayadmin'
 
@@ -61,6 +70,9 @@ write_files:
       IDENTITY_CLIENT_ID=__IDENTITY_CLIENT_ID__
       KEY_VAULT=__KEY_VAULT__
       PASSPHRASE_SECRET=__PASSPHRASE_SECRET__
+      STORAGE_ACCOUNT=__STORAGE_ACCOUNT__
+      BLOB_ENDPOINT=__BLOB_ENDPOINT__
+      HLS_DIR=__HLS_DIR__
 
   - path: /usr/local/bin/relay-acr-login.sh
     permissions: '0755'
@@ -99,12 +111,65 @@ write_files:
       PASSPHRASE=$(az keyvault secret show --vault-name "$KEY_VAULT" \
         --name "$PASSPHRASE_SECRET" --query value -o tsv)
       docker rm -f stream-relay >/dev/null 2>&1 || true
+      mkdir -p "$HLS_DIR"
+      # 8888 is bound to LOCALHOST ONLY now. Delivery is via Blob, so nothing outside the
+      # VM should reach MediaMTX's HTTP server - and its session-gated responses are useless
+      # to a CDN anyway. Only the SRT port is published.
       docker run -d --name stream-relay --restart unless-stopped \
         -e SRT_PUBLISH_PASSPHRASE="$PASSPHRASE" \
         -v /etc/stream-relay/config:/config:ro \
-        -p 8890:8890/udp -p 8888:8888 \
+        -v "$HLS_DIR":/hls \
+        -p 8890:8890/udp -p 127.0.0.1:8888:8888 \
         "$IMAGE"
       unset PASSPHRASE
+
+  - path: /usr/local/bin/relay-hls-sync.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Mirror MediaMTX's hlsDirectory into the storage account's $web container.
+      #
+      # This is the delivery tier. MediaMTX's own HLS server cannot be served through a CDN
+      # (it 302s to a cookieCheck, sends "Cache-Control: private, no-cache", and 401s the
+      # variant playlist without a per-viewer session), so segments are written to disk and
+      # published as ordinary static files instead.
+      #
+      # azcopy rather than the az CLI: az uploads one blob per invocation at roughly a
+      # second each, which cannot keep up with several channels' segments. azcopy sync
+      # walks the tree and transfers only what changed.
+      set -uo pipefail
+      source /etc/stream-relay/env
+      export AZCOPY_AUTO_LOGIN_TYPE=MSI
+      export AZCOPY_MSI_CLIENT_ID="$IDENTITY_CLIENT_ID"
+      # Keep azcopy's plan/log files out of the root filesystem's way.
+      export AZCOPY_JOB_PLAN_LOCATION=/var/lib/stream-relay/azcopy-plans
+      export AZCOPY_LOG_LOCATION=/var/lib/stream-relay/azcopy-logs
+      mkdir -p "$AZCOPY_JOB_PLAN_LOCATION" "$AZCOPY_LOG_LOCATION" "$HLS_DIR"
+
+      DEST="${BLOB_ENDPOINT}\$web"
+      while true; do
+        # --delete-destination prunes segments MediaMTX has rolled off, so the container
+        # does not grow without bound between lifecycle sweeps.
+        azcopy sync "$HLS_DIR" "$DEST" \
+          --recursive \
+          --delete-destination=true \
+          --log-level=ERROR \
+          >/dev/null 2>&1 || echo "azcopy sync failed at $(date -Is)" >&2
+        sleep 2
+      done
+
+  - path: /etc/systemd/system/relay-hls-sync.service
+    content: |
+      [Unit]
+      Description=Mirror MediaMTX HLS output to Blob Storage
+      After=stream-relay.service
+      Requires=stream-relay.service
+      [Service]
+      ExecStart=/usr/local/bin/relay-hls-sync.sh
+      Restart=always
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
 
   - path: /etc/systemd/system/stream-relay.service
     content: |
@@ -145,12 +210,18 @@ write_files:
 runcmd:
   - curl -fsSL https://get.docker.com | sh
   - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
-  - mkdir -p /etc/stream-relay/config
+  # azcopy: the HLS mirror needs throughput the az CLI cannot provide.
+  - curl -sL "https://aka.ms/downloadazcopy-v10-linux" -o /tmp/azcopy.tar.gz
+  - tar -xzf /tmp/azcopy.tar.gz -C /tmp
+  - install -m 0755 /tmp/azcopy_linux_amd64_*/azcopy /usr/local/bin/azcopy
+  - rm -rf /tmp/azcopy.tar.gz /tmp/azcopy_linux_amd64_*
+  - mkdir -p /etc/stream-relay/config __HLS_DIR__
   - systemctl daemon-reload
   - systemctl enable --now relay-acr-refresh.timer
   # stream-relay.service is enabled but NOT started here: the config template has not
   # been delivered yet. configure-vm starts it once /etc/stream-relay/config is populated.
   - systemctl enable stream-relay.service
+  - systemctl enable relay-hls-sync.service
 '''
 
 var renderedCloudInit = replace(
@@ -165,6 +236,16 @@ var renderedCloudInit = replace(
   ),
   '__PASSPHRASE_SECRET__',
   passphraseSecretName
+)
+
+var fullyRenderedCloudInit = replace(
+  replace(
+    replace(renderedCloudInit, '__STORAGE_ACCOUNT__', storageAccountName),
+    '__BLOB_ENDPOINT__',
+    storageBlobEndpoint
+  ),
+  '__HLS_DIR__',
+  hlsDirectory
 )
 
 resource nic 'Microsoft.Network/networkInterfaces@2023-09-01' = {
@@ -222,7 +303,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     osProfile: {
       computerName: vmName
       adminUsername: adminUsername
-      customData: base64(renderedCloudInit)
+      customData: base64(fullyRenderedCloudInit)
       linuxConfiguration: {
         // Password auth is always off. Azure then REQUIRES an SSH key - it rejects a Linux
         // profile with neither ("Authentication using either SSH or by user name and

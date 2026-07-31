@@ -16,7 +16,10 @@ param srtPort int
 @description('Source CIDRs allowed to PUBLISH via SRT. Empty means Internet, which is acceptable only because the stream is encrypted and the passphrase gates publishing.')
 param ingestAllowedSources array = []
 
-@description('Whether to restrict HLS egress to campus/VPN ranges instead of allowing Front Door broadly.')
+@description('Whether to open the MediaMTX HTTP port at all. FALSE once HLS is delivered from Blob Storage: nothing outside the VM needs it, and closing it removes the only way to bypass the CDN, WAF and cache.')
+param exposeHlsPort bool = false
+
+@description('Whether to restrict HLS egress to campus/VPN ranges instead of allowing Front Door broadly. Only meaningful when exposeHlsPort is true.')
 param restrictEgressToCampus bool = false
 
 @description('Campus/VPN CIDRs, used when restrictEgressToCampus is true.')
@@ -62,14 +65,13 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
         }
       }
       {
-        // HLS egress, reachable only from Front Door's backend range - not the open
-        // internet - so the CDN cannot be bypassed and the origin cannot be scraped
-        // directly, which would sidestep the WAF rate limit and the cache.
+        // Retained only for the legacy topology where MediaMTX served HLS directly. With
+        // delivery on Blob this rule is DENY, so the media server is unreachable over HTTP.
         name: 'allow-hls-from-frontdoor'
         properties: {
           priority: 110
           direction: 'Inbound'
-          access: 'Allow'
+          access: exposeHlsPort ? 'Allow' : 'Deny'
           protocol: 'Tcp'
           sourceAddressPrefix: restrictEgressToCampus ? null : 'AzureFrontDoor.Backend'
           sourceAddressPrefixes: restrictEgressToCampus ? campusRanges : null

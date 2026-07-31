@@ -36,7 +36,13 @@ resource_exists() {
 
 emit() { printf '%s' "$1"; }
 
-case "$1 ${2:-} ${3:-}" in
+# Key on the first FOUR words. Three was not enough: commands like
+#   az storage blob service-properties show
+#   az network front-door waf-policy show
+# have their verb in position 4, so every such pattern silently fell through to the
+# unhandled-command branch and the caller took its error path instead. That made some
+# assertions pass for the wrong reason.
+case "$1 ${2:-} ${3:-} ${4:-}" in
   "account show "*)
     emit '{"id":"00000000-0000-0000-0000-000000000000","name":"MOCK-sub","user":{"name":"mock@princeton.edu"},"tenantId":"11111111-1111-1111-1111-111111111111"}'
     ;;
@@ -143,6 +149,24 @@ case "$1 ${2:-} ${3:-}" in
   "keyvault secret set"*) ;;
 
   "acr build"*) ;;
+  "acr delete"*) ;;
+
+  "storage blob service-properties show"*)
+    # Static-website hosting is off on a fresh account and must be switched on explicitly;
+    # there is no ARM equivalent.
+    case "$MOCK_AZ_SCENARIO" in
+      existing|orphaned-disk|missing-rbac) emit 'true' ;;
+      *) emit 'false' ;;
+    esac
+    ;;
+  "storage blob service-properties update"*) ;;
+  "storage account show"*) emit 'https://storfeorferelayhls.z13.web.core.windows.net/' ;;
+  "storage account delete"*) ;;
+
+  "keyvault list-deleted"*) emit '' ;;
+  "keyvault purge"*) ;;
+  "keyvault delete"*) ;;
+  "identity delete"*) ;;
 
   "afd endpoint show"*) emit 'orfe-relay-mockhash1234.z01.azurefd.net' ;;
 

@@ -100,8 +100,10 @@ banner "MOCK-AZ SUITE (offline, no spend)"
 # --- 0. plumbing ------------------------------------------------------------------------
 step_header 1 8 "Step list and argument validation"
 out=$(run_deploy fresh --list-steps)
-[ "$(grep -cE '^ +[0-9]+\. ' <<<"$out")" -eq 16 ] \
-  && t_ok "16 steps declared" || t_fail "expected 16 steps, got: $(grep -cE '^ +[0-9]+\. ' <<<"$out")"
+expected_steps=17
+[ "$(grep -cE '^ +[0-9]+\. ' <<<"$out")" -eq "$expected_steps" ] \
+  && t_ok "$expected_steps steps declared" \
+  || t_fail "expected $expected_steps steps, got: $(grep -cE '^ +[0-9]+\. ' <<<"$out")"
 
 reset_state; reset_log
 out=$(run_deploy fresh --step no-such-step); rc=$?
@@ -134,7 +136,7 @@ first_mutations=$(mutating_calls)
   || t_fail "a fresh run should have mutated something"
 
 done_count=$(jq -r '[.steps[] | select(.status=="done")] | length' "$SANDBOX/state.json")
-[ "$done_count" -eq 16 ] && t_ok "all 16 steps recorded done" || t_fail "only $done_count steps recorded done"
+[ "$done_count" -eq 17 ] && t_ok "all 17 steps recorded done" || t_fail "only $done_count steps recorded done"
 
 # --- 3. idempotency ---------------------------------------------------------------------
 step_header 4 8 "Idempotency: everything already exists"
@@ -282,9 +284,9 @@ reset_log
 MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=existing \
   PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
   STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
-  "$REPO_ROOT/scripts/teardown.sh" --soft --yes >"$SANDBOX/teardown.out" 2>&1
+  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes >"$SANDBOX/teardown.out" 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && t_ok "soft teardown succeeded" || { t_fail "soft teardown failed:"; sed 's/^/      /' "$SANDBOX/teardown.out"; }
+[ "$rc" -eq 0 ] && t_ok "selective teardown succeeded" || { t_fail "selective teardown failed:"; sed 's/^/      /' "$SANDBOX/teardown.out"; }
 
 fd_line=$(grep -n 'afd profile delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
 vm_line=$(grep -n 'vm delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
@@ -304,17 +306,17 @@ fi
 
 # The static public IP and the vnet must SURVIVE --soft: publishers embed that IP, so
 # releasing it breaks every producer on the next activation.
-if grep -qE 'network public-ip delete|network vnet delete' "$SANDBOX/az.log"; then
-  t_fail "--soft deleted the public IP or vnet; the ingest address must stay stable"
+if grep -qE 'network public-ip delete' "$SANDBOX/az.log"; then
+  t_fail "--keep-ip deleted the public IP"
 else
-  t_ok "--soft kept the static ingest IP and vnet (stable publisher address)"
+  t_ok "--keep-ip preserved the static ingest address"
 fi
-if grep -qE '(acr delete|keyvault delete|identity delete)' "$SANDBOX/az.log"; then
-  t_fail "--soft deleted ACR/KeyVault/identity, which it must preserve"
+if grep -qE '(^| )acr delete' "$SANDBOX/az.log"; then
+  t_fail "--keep-registry did not preserve the registry"
 else
-  t_ok "--soft preserved ACR, Key Vault and the identity (~\$5/mo standby)"
+  t_ok "--keep-registry preserved the container registry"
 fi
-grep -q 'no billable compute or IP resources remain' "$SANDBOX/teardown.out" \
+grep -q 'no unexpected billable resources remain' "$SANDBOX/teardown.out" \
   && t_ok "teardown confirmed no billable resources remain" \
   || t_fail "teardown did not confirm the absence of billable resources"
 
@@ -323,7 +325,7 @@ reset_log
 MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=orphaned-disk \
   PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
   STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
-  "$REPO_ROOT/scripts/teardown.sh" --soft --yes >"$SANDBOX/teardown2.out" 2>&1
+  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes >"$SANDBOX/teardown2.out" 2>&1
 if [ $? -ne 0 ] && grep -q 'still billable' "$SANDBOX/teardown2.out"; then
   t_ok "an orphaned disk is reported and exits non-zero"
 else

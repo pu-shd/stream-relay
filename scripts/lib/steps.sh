@@ -20,6 +20,7 @@ STEPS=(
   federated-credential
   key-vault
   acr
+  storage
   build-push-image
   network
   vm
@@ -40,6 +41,7 @@ step_description() {
     federated-credential) echo "Trust GitHub Actions via OIDC (no secret)" ;;
     key-vault)            echo "Create the vault and store the SRT passphrase" ;;
     acr)                  echo "Create the registry and grant pull to the identity" ;;
+    storage)              echo "Enable static-website hosting on the delivery account" ;;
     build-push-image)     echo "Build the relay image and push it to ACR" ;;
     network)              echo "Create vnet, NSG and the STATIC public IP" ;;
     vm)                   echo "Create the relay VM with its managed identity" ;;
@@ -259,6 +261,46 @@ do_identity()             { deploy_bicep "identity"; }
 do_federated-credential() { skipped "created by the Bicep deployment (identity module)"; }
 do_key-vault()            { ensure_passphrase; }
 do_acr()                  { skipped "created by the Bicep deployment (acr module)"; }
+
+do_storage() {
+  require_env AZ_STORAGE_ACCOUNT
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    info "[dry-run] would enable static-website hosting on $AZ_STORAGE_ACCOUNT"
+    return 0
+  fi
+
+  # Static-website hosting is a DATA-PLANE property, not an ARM one: there is no Bicep or
+  # template equivalent, so it has to be switched on with a CLI call after the account
+  # exists. Miss this and the $web endpoint 404s everything while every resource looks
+  # perfectly healthy in the portal.
+  local enabled
+  enabled=$(az_query storage blob service-properties show \
+    --account-name "$AZ_STORAGE_ACCOUNT" --auth-mode login \
+    --query "staticWebsite.enabled" -o tsv || echo "")
+
+  if [ "$enabled" = "true" ]; then
+    skipped "static-website hosting already enabled"
+  else
+    # --auth-mode login because the account has shared-key access disabled: there is no
+    # account key to fall back on, by design.
+    az_do storage blob service-properties update \
+      --account-name "$AZ_STORAGE_ACCOUNT" --auth-mode login \
+      --static-website true \
+      --index-document index.m3u8 \
+      --404-document index.m3u8 -o none \
+      || die "could not enable static-website hosting on $AZ_STORAGE_ACCOUNT.
+    This needs 'Storage Blob Data Contributor' (or Owner) on the account for YOUR account,
+    not just the VM identity, because it is a data-plane call."
+    ok "enabled static-website hosting"
+  fi
+
+  local host
+  host=$(az_query storage account show -n "$AZ_STORAGE_ACCOUNT" \
+    --query "primaryEndpoints.web" -o tsv || echo "")
+  [ -n "$host" ] && info "delivery origin: $host"
+  state_record_output staticWebsiteEndpoint "$host"
+  return 0
+}
 do_network()              { skipped "created by the Bicep deployment (network module)"; }
 do_vm()                   { skipped "created by the Bicep deployment (vm module)"; }
 do_front-door()           { skipped "created by the Bicep deployment (frontdoor module)"; }

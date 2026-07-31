@@ -19,6 +19,9 @@ param location string
 @description('Container registry name (globally unique, alphanumeric only).')
 param acrName string
 
+@description('Storage account serving HLS. MediaMTX cannot be served through a CDN (session-gated, private/no-cache), so delivery is static files from this account instead.')
+param storageAccountName string
+
 @description('Key Vault holding the SRT publish passphrase. Read by the VM\'s managed identity; never by a pipeline.')
 param keyVaultName string
 
@@ -119,6 +122,16 @@ module registry 'modules/acr.bicep' = {
   }
 }
 
+module storage 'modules/storage.bicep' = {
+  name: 'storage-deploy'
+  params: {
+    storageAccountName: storageAccountName
+    location: location
+    writerPrincipalId: identity.outputs.vmPrincipalId
+    deployRoleAssignments: deployRoleAssignments
+  }
+}
+
 module network 'modules/network.bicep' = {
   name: 'network-deploy'
   params: {
@@ -126,8 +139,10 @@ module network 'modules/network.bicep' = {
     location: location
     srtPort: srtPort
     ingestAllowedSources: ingestAllowedSources
-    // pugwipsEnabled tightens HLS egress to campus ranges instead of allowing the whole
-    // Front Door backend tag.
+    // HLS is served from Blob now, so NOTHING needs to reach the VM over HTTP. Closing
+    // 8888 removes the origin-bypass surface entirely: there is no longer a way to reach
+    // the media server directly and sidestep the CDN, WAF and cache.
+    exposeHlsPort: false
     restrictEgressToCampus: pugwipsEnabled
     campusRanges: campusRanges
   }
@@ -146,6 +161,8 @@ module relayVm 'modules/vm.bicep' = {
     acrLoginServer: registry.outputs.loginServer
     keyVaultName: keyVault.outputs.name
     passphraseSecretName: passphraseSecretName
+    storageAccountName: storage.outputs.name
+    storageBlobEndpoint: storage.outputs.blobEndpoint
     sshPublicKey: sshPublicKey
   }
 }
@@ -155,7 +172,9 @@ module frontDoor 'modules/frontdoor.bicep' = {
   params: {
     profileName: frontDoorProfileName
     endpointName: frontDoorEndpointName
-    originHostName: network.outputs.publicIpAddress
+    // Origin is the storage static-website host, NOT the VM. This is the whole point of
+    // the delivery split.
+    originHostName: storage.outputs.staticWebsiteHostName
     customDomain: customDomain
     wafRateLimitRpm: wafRateLimitRpm
   }
@@ -186,6 +205,8 @@ output ingestIpAddress string = network.outputs.publicIpAddress
 output ingestPort int = srtPort
 output ingestUrlTemplate string = 'srt://${network.outputs.publicIpAddress}:${srtPort}?streamid=publish:<path>&passphrase=<secret>&pbkeylen=32&latency=200000'
 output acrLoginServer string = registry.outputs.loginServer
+output storageAccountName string = storage.outputs.name
+output staticWebsiteHostName string = storage.outputs.staticWebsiteHostName
 output keyVaultName string = keyVault.outputs.name
 // The CI client id is what goes into the AZURE_CLIENT_ID repository variable.
 output ciIdentityClientId string = identity.outputs.ciClientId
