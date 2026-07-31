@@ -10,7 +10,7 @@ distribution plane on Azure with MediaMTX + ffmpeg + Azure Front Door, **without
 single line of `page-stream`**.
 
 > **This is a fallback, not production.** It is designed to be deployed from nothing in under
-> 30 minutes and torn down to ~$5/month. If you found it running and nobody is mid-cutover,
+> 30 minutes and torn down to ~$9/month. If you found it running and nobody is mid-cutover,
 > something is wrong — see [Cost posture](#cost-posture).
 
 ---
@@ -68,7 +68,7 @@ Container Instances can expose UDP and would remove OS management, but costs mor
 24/7 and gives up the restart/health control this design relies on. **Delivery**, by contrast,
 needs no VM — which is exactly what the fix above exploits.
 
-## Contents## Contents
+## Contents
 
 - [Why MediaMTX (and not YouTube)](#why-mediamtx-and-not-youtube)
 - [Why Azure](#why-azure)
