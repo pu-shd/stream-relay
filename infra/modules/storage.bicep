@@ -35,6 +35,9 @@ param deployRoleAssignments bool = false
 @description('Days after which stale HLS files are deleted. Live segments are rewritten constantly; anything older than this is debris from a previous activation.')
 param segmentRetentionDays int = 1
 
+@description('Object ID of the human operator. Needed because enabling static-website hosting is a DATA-PLANE call, and Owner is a control-plane role that grants no blob data access at all. Empty to skip.')
+param operatorObjectId string = ''
+
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
   location: location
@@ -123,6 +126,19 @@ resource writerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' =
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobContributorRoleId)
     principalId: writerPrincipalId
     principalType: 'ServicePrincipal'
+  }
+}
+
+// Owner does NOT imply blob data-plane access. Without this the operator cannot run
+// `az storage blob service-properties update --static-website`, which is the only way to
+// turn on static hosting - there is no ARM equivalent - and the deployment would come up
+// with a $web endpoint that 404s everything.
+resource operatorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRoleAssignments && !empty(operatorObjectId)) {
+  scope: storage
+  name: guid(storage.id, operatorObjectId, blobContributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobContributorRoleId)
+    principalId: operatorObjectId
   }
 }
 

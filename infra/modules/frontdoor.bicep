@@ -13,8 +13,14 @@ param profileName string
 @description('Endpoint name. NOTE: the resulting hostname is <endpoint>-<hash>.z01.azurefd.net; the hash cannot be predicted.')
 param endpointName string
 
-@description('Origin hostname - the relay VM public IP.')
+@description('Origin hostname - the Blob static-website host. NOT the VM: MediaMTX cannot be served through a CDN.')
 param originHostName string
+
+@description('Origin HTTP port. 80 for the Blob static website; the old MediaMTX topology used 8888.')
+param originHttpPort int = 80
+
+@description('Origin HTTPS port. 443 for the Blob static website.')
+param originHttpsPort int = 443
 
 @description('Custom domain FQDN, or empty for none.')
 param customDomain string = ''
@@ -74,15 +80,18 @@ resource originGroup 'Microsoft.Cdn/profiles/originGroups@2024-02-01' = {
       successfulSamplesRequired: 3
       additionalLatencyInMilliseconds: 50
     }
-    healthProbeSettings: {
-      // Probe a path that exists whether or not anything is publishing. MediaMTX returns
-      // 404 for an idle path, so probing a channel would mark the origin unhealthy
-      // whenever the displays were idle.
-      probePath: '/'
-      probeRequestType: 'HEAD'
-      probeProtocol: 'Http'
-      probeIntervalInSeconds: 30
-    }
+    // HEALTH PROBES ARE DELIBERATELY DISABLED.
+    //
+    // With a single origin there is nothing to fail over TO, so a probe can only ever take
+    // the service down - and it did: probing '/' over HTTP against a Blob static website
+    // returns 404 (there is no root document) on an account that is HTTPS-only, so Front
+    // Door marked the origin unhealthy and answered 404 for every request while the origin
+    // itself served /news/index.m3u8 with a 200.
+    //
+    // Omitting healthProbeSettings disables probing entirely. If a second origin is ever
+    // added, reinstate probes with probeProtocol: 'Https' AND a probePath that genuinely
+    // returns 200 - note the HLS mirror runs with --delete-destination, so any static
+    // health file placed in $web would be deleted on the next sync.
     sessionAffinityState: 'Disabled'
   }
 }
@@ -92,15 +101,16 @@ resource origin 'Microsoft.Cdn/profiles/originGroups/origins@2024-02-01' = {
   name: 'relay-vm'
   properties: {
     hostName: originHostName
-    httpPort: 8888
-    httpsPort: 8888
+    httpPort: originHttpPort
+    httpsPort: originHttpsPort
     originHostHeader: originHostName
     priority: 1
     weight: 1000
     enabledState: 'Enabled'
-    // MediaMTX serves plain HTTP on 8888. TLS is terminated at the edge; the origin hop
-    // is protected by the NSG restricting 8888 to the AzureFrontDoor.Backend tag.
-    enforceCertificateNameCheck: false
+    // The Blob static website presents a real certificate for *.web.core.windows.net, and
+    // the account enforces HTTPS-only, so the origin hop is encrypted and verified. Under
+    // the old MediaMTX topology this had to be false (plain HTTP on 8888).
+    enforceCertificateNameCheck: true
   }
 }
 
@@ -213,7 +223,9 @@ resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
     ]
     supportedProtocols: ['Http', 'Https']
     patternsToMatch: ['/*']
-    forwardingProtocol: 'HttpOnly'
+    // HttpsOnly: the storage account sets supportsHttpsTrafficOnly, so an HTTP origin
+    // request would be rejected outright.
+    forwardingProtocol: 'HttpsOnly'
     linkToDefaultDomain: 'Enabled'
     httpsRedirect: 'Enabled'
     enabledState: 'Enabled'

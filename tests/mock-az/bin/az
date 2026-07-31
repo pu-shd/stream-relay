@@ -194,10 +194,17 @@ case "$1 ${2:-} ${3:-} ${4:-}" in
     if printf '%s' "$*" | grep -q 'cloud-init status'; then
       emit 'status: done'
     elif [ "$MOCK_AZ_SCENARIO" = "relay-unhealthy" ]; then
-      emit 'service=failed'
+      emit 'service=failed mirror=failed'
+    elif [ "$MOCK_AZ_SCENARIO" = "mirror-down" ]; then
+      # MediaMTX healthy but the mirror dead: segments pile up on the VM and the CDN
+      # serves 404s. Looks fine from the container's point of view, delivers nothing.
+      emit 'RELAY_HEALTHY
+service=active mirror=failed
+Up 10 seconds (healthy)'
     else
       emit 'RELAY_HEALTHY
-service=active
+MIRROR_ACTIVE
+service=active mirror=active
 Up 10 seconds (healthy)'
     fi
     ;;

@@ -150,11 +150,14 @@ write_files:
       while true; do
         # --delete-destination prunes segments MediaMTX has rolled off, so the container
         # does not grow without bound between lifecycle sweeps.
-        azcopy sync "$HLS_DIR" "$DEST" \
-          --recursive \
-          --delete-destination=true \
-          --log-level=ERROR \
-          >/dev/null 2>&1 || echo "azcopy sync failed at $(date -Is)" >&2
+        # Capture the error rather than discarding it: an earlier version sent stderr to
+        # /dev/null and logged only "sync failed", which hid the actual cause completely.
+        if ! out=$(azcopy sync "$HLS_DIR" "$DEST" \
+              --recursive \
+              --delete-destination=true \
+              --log-level=ERROR 2>&1); then
+          echo "azcopy sync failed: $(tail -3 <<<"$out" | tr '\n' ' ')" >&2
+        fi
         sleep 2
       done
 
@@ -221,6 +224,8 @@ runcmd:
   # stream-relay.service is enabled but NOT started here: the config template has not
   # been delivered yet. configure-vm starts it once /etc/stream-relay/config is populated.
   - systemctl enable stream-relay.service
+  # enable only: the mirror needs the HLS directory to exist, which happens when
+  # stream-relay first runs. configure-vm starts it, and it is Restart=always after.
   - systemctl enable relay-hls-sync.service
 '''
 

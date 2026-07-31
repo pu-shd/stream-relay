@@ -128,6 +128,7 @@ module storage 'modules/storage.bicep' = {
     storageAccountName: storageAccountName
     location: location
     writerPrincipalId: identity.outputs.vmPrincipalId
+    operatorObjectId: operatorObjectId
     deployRoleAssignments: deployRoleAssignments
   }
 }

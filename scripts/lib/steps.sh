@@ -392,7 +392,23 @@ deploy_bicep() {
   fi
 
   local out
-  out=$(az "${args[@]}" -o json) || die "bicep deployment failed"
+  if ! out=$(az "${args[@]}" -o json 2>&1); then
+    # Azure refuses to change cloud-init on an existing VM:
+    #   PropertyChangeNotAllowed: Changing property 'osProfile.customData' is not allowed.
+    # Any edit to the cloud-init block therefore requires REPLACING the VM. That is cheap
+    # here by design - the VM holds no state, its config comes from the config repo and its
+    # secret from Key Vault - but the deployment cannot do it implicitly, because deleting
+    # someone's running relay as a side effect of a template edit would be unforgivable.
+    if grep -q "osProfile.customData" <<<"$out"; then
+      fail "the VM's cloud-init changed, and Azure does not permit that on an existing VM"
+      info "the VM is disposable (no state on it). Recreate it with:"
+      detail "az vm delete -g $AZ_RESOURCE_GROUP -n $AZ_VM_NAME --yes"
+      detail "scripts/deploy.sh --from identity"
+      die "refusing to delete a running VM implicitly"
+    fi
+    printf '%s\n' "$out" | tail -20 >&2
+    die "bicep deployment failed"
+  fi
   for key in frontDoorHostName ingestIpAddress acrLoginServer keyVaultName identityClientId; do
     local v
     v=$(jq -r --arg k "$key" '.properties.outputs[$k].value // empty' <<<"$out")
@@ -487,15 +503,30 @@ for i in \$(seq 1 24); do
   fi
   sleep 5
 done
-echo \"service=\$(systemctl is-active stream-relay)\"
+# The mirror is a SEPARATE unit. cloud-init only enables it (it cannot start before the
+# config exists), so it must be started here - and asserted, or the relay looks healthy
+# while nothing is actually being delivered.
+systemctl restart relay-hls-sync.service || true
+sleep 10
+systemctl is-active --quiet relay-hls-sync && echo MIRROR_ACTIVE
+echo \"service=\$(systemctl is-active stream-relay) mirror=\$(systemctl is-active relay-hls-sync)\"
 docker ps --filter name=stream-relay --format '{{.Status}}' || true
-journalctl -u stream-relay --no-pager -n 12 2>&1 | tail -12" \
+journalctl -u stream-relay --no-pager -n 8 2>&1 | tail -8
+journalctl -u relay-hls-sync --no-pager -n 8 2>&1 | tail -8" \
     --query "value[0].message" -o tsv 2>&1)
 
-  if grep -q 'RELAY_HEALTHY' <<<"$result"; then
-    ok "config delivered; MediaMTX container is healthy"
+  local relay_ok=0 mirror_ok=0
+  grep -q 'RELAY_HEALTHY' <<<"$result" && relay_ok=1
+  grep -q 'MIRROR_ACTIVE' <<<"$result" && mirror_ok=1
+
+  if [ "$relay_ok" = "1" ] && [ "$mirror_ok" = "1" ]; then
+    ok "MediaMTX healthy and the HLS mirror is running"
     return 0
   fi
+  [ "$relay_ok" = "1" ] && ok "MediaMTX container is healthy"
+  # A healthy MediaMTX with a dead mirror publishes to nobody: segments accumulate on the
+  # VM's disk and the CDN serves 404s. Treat it as a failure of the step, not a warning.
+  [ "$mirror_ok" = "1" ] || fail "the HLS mirror (relay-hls-sync) is not running — nothing reaches Blob Storage"
 
   fail "the relay did not become healthy after config delivery"
   printf '%s\n' "$result" | sed 's/^/      /' >&2

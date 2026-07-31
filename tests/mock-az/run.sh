@@ -280,6 +280,15 @@ else
   t_fail "register-providers did not register the unregistered provider"
 fi
 
+# A healthy MediaMTX with a dead mirror delivers nothing, so it must fail the step.
+reset_state; reset_log
+out=$(run_deploy mirror-down --step configure-vm)
+if [ $? -ne 0 ] && grep -q "mirror" <<<"$out"; then
+  t_ok "a dead HLS mirror fails configure-vm even when MediaMTX is healthy"
+else
+  t_fail "configure-vm passed with the mirror down:\n$out"
+fi
+
 # --- 6. secret hygiene ------------------------------------------------------------------
 step_header 8 8 "Secret hygiene and teardown"
 reset_state; reset_log
