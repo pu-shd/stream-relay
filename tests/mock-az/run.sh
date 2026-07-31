@@ -44,6 +44,7 @@ setup_config() {
 AZ_REGION=eastus
 AZ_RESOURCE_GROUP=orfe-dept-azure-relay-rg
 AZ_ACR_NAME=acrorfestreamrelay
+AZ_STORAGE_ACCOUNT=storfeorferelayhls
 AZ_KEY_VAULT=kv-orfe-relay
 AZ_IDENTITY_CI=id-orfe-relay-ci
 AZ_IDENTITY_VM=id-orfe-relay-vm
@@ -96,6 +97,23 @@ reset_log()   { : > "$SANDBOX/az.log"; }
 reset_state() { rm -f "$SANDBOX/state.json"; }
 
 banner "MOCK-AZ SUITE (offline, no spend)"
+
+# --- fixture completeness ---------------------------------------------------------------
+# CI has no config repo checked out, so it uses the inline fallback fixture. Any variable
+# the step library requires but the fixture omits fails in CI while passing locally - which
+# has already happened twice. Check it up front instead.
+step_header 0 8 "Fixture covers every required variable"
+missing_vars=""
+for v in $(grep -ohE 'require_env [A-Z_ ]+' "$REPO_ROOT/scripts/lib/steps.sh" \
+             | sed 's/require_env //' | tr ' ' '\n' | sort -u); do
+  [ -n "$v" ] || continue
+  grep -q "^${v}=" "$CONFIG/orfe/deploy.env" || missing_vars="$missing_vars $v"
+done
+if [ -n "$missing_vars" ]; then
+  t_fail "deploy.env fixture is missing:$missing_vars"
+else
+  t_ok "fixture defines every require_env variable"
+fi
 
 # --- 0. plumbing ------------------------------------------------------------------------
 step_header 1 8 "Step list and argument validation"
