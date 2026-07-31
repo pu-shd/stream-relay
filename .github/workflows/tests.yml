@@ -76,6 +76,41 @@ jobs:
             || { echo "::error::public IP is not static — publishers embed it and would break on VM restart"; exit 1; }
           echo "public IP is static"
 
+      - name: Assert federated credentials are created serially
+        # Azure rejects concurrent FIC writes under one managed identity with
+        # ConcurrentFederatedIdentityCredentialsWritesForSingleManagedIdentity. Two parallel
+        # loops hit exactly that during the first real deployment, so the credentials are
+        # flattened into ONE @batchSize(1) loop. Both properties are load-bearing.
+        run: |
+          id=infra/modules/identity.bicep
+          grep -q '@batchSize(1)' "$id" \
+            || { echo "::error::federated credentials are not serialized; Azure rejects concurrent FIC writes"; exit 1; }
+          n=$(grep -c "federatedIdentityCredentials@" "$id")
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly one federatedIdentityCredentials loop, found $n."
+            echo "::error::Separate per-kind loops deploy in parallel and Azure rejects them."
+            exit 1
+          fi
+          echo "federated credentials are created one at a time"
+
+      - name: Assert CI cannot be granted role-assignment rights
+        # The whole point of the identity split: creating role assignments needs User Access
+        # Administrator, and a workflow holding that can grant itself anything.
+        run: |
+          grep -q "param deployRoleAssignments bool = false" infra/main.bicep \
+            || { echo "::error::deployRoleAssignments must default to false (the CI posture)"; exit 1; }
+          for m in acr keyvault identity; do
+            grep -q "deployRoleAssignments" "infra/modules/$m.bicep" \
+              || { echo "::error::infra/modules/$m.bicep creates RBAC without gating it"; exit 1; }
+          done
+          grep -q "'Contributor'\|contributorRoleId" infra/modules/identity.bicep \
+            || { echo "::error::CI identity is never granted Contributor; deployments would fail"; exit 1; }
+          if grep -qE "userAccessAdministrator|18d7d88d-d35e-4fb5-a5c3-7773c20a72d9" infra/modules/*.bicep; then
+            echo "::error::a module grants User Access Administrator — that is an escalation path"
+            exit 1
+          fi
+          echo "role-assignment creation is gated and CI cannot escalate"
+
   mock-az:
     name: Deployment scripts (mock az)
     runs-on: ubuntu-latest

@@ -155,7 +155,21 @@ case "$1 ${2:-} ${3:-}" in
 
   "vm show"*) resource_exists vm || exit 1 ;;
   "vm delete"*) ;;
-  "vm run-command invoke"*) emit '{"value":[{"message":"Up 10 seconds"}]}' ;;
+  "vm run-command invoke"*)
+    # configure-vm asks two different things through Run Command: whether cloud-init has
+    # finished, and whether the relay container became healthy. Returning a generic string
+    # for both made the cloud-init wait loop spin for its full 600s timeout, which hung the
+    # offline suite - a mock that is too vague costs real test time.
+    if printf '%s' "$*" | grep -q 'cloud-init status'; then
+      emit 'status: done'
+    elif [ "$MOCK_AZ_SCENARIO" = "relay-unhealthy" ]; then
+      emit 'service=failed'
+    else
+      emit 'RELAY_HEALTHY
+service=active
+Up 10 seconds (healthy)'
+    fi
+    ;;
 
   "network nsg show"*|"network vnet show"*|"network nic show"*)
     resource_exists network || exit 1 ;;

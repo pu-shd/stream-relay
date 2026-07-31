@@ -19,7 +19,7 @@ param publicIpId string
 @description('User-assigned managed identity resource ID.')
 param identityId string
 
-@description('Client ID of that identity, needed for `az login --identity --username`.')
+@description('Client ID of that identity, for `az login --identity --client-id`.')
 param identityClientId string
 
 @description('ACR login server, e.g. myregistry.azurecr.io.')
@@ -37,7 +37,7 @@ param passphraseSecretName string
 @description('Admin username. No password and no SSH key are configured - see below.')
 param adminUsername string = 'relayadmin'
 
-@description('SSH public key. Empty means no inbound SSH path at all; manage via Run Command.')
+@description('SSH public key. REQUIRED by Azure in practice: a Linux VM must have either a password or an SSH key, so "no auth at all" is not expressible. deploy.sh generates an ephemeral key and discards the private half when this is empty.')
 param sshPublicKey string = ''
 
 // cloud-init. Kept declarative and idempotent so `update.sh` can re-run it.
@@ -69,7 +69,11 @@ write_files:
       # Refresh the ACR credential using the VM's managed identity. No secret on disk.
       set -euo pipefail
       source /etc/stream-relay/env
-      az login --identity --username "$IDENTITY_CLIENT_ID" --allow-no-subscriptions >/dev/null
+      # --client-id, NOT --username. Modern az CLI rejects the latter outright:
+      #   "Passing the managed identity ID with --username is no longer supported.
+      #    Use --client-id, --object-id or --resource-id instead."
+      # Microsoft's managed-identity docs still show --username, so this is a trap.
+      az login --identity --client-id "$IDENTITY_CLIENT_ID" --allow-no-subscriptions >/dev/null
       az acr login --name "${ACR_LOGIN_SERVER%%.*}" >/dev/null
       echo "acr login refreshed at $(date -Is)"
 
@@ -79,6 +83,15 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       source /etc/stream-relay/env
+      # Wait for the tooling cloud-init installs. Without this the unit races cloud-init on
+      # first boot AND on any reboot, failing with "az: command not found" - and because the
+      # unit is Type=oneshot, systemd never retries it.
+      for _ in $(seq 1 60); do
+        command -v az >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && break
+        sleep 5
+      done
+      command -v az >/dev/null 2>&1 || { echo "az CLI never appeared"; exit 1; }
+      command -v docker >/dev/null 2>&1 || { echo "docker never appeared"; exit 1; }
       /usr/local/bin/relay-acr-login.sh
       docker pull "$IMAGE"
       # Read the passphrase from Key Vault via managed identity. Passed to the container
@@ -104,6 +117,10 @@ write_files:
       RemainAfterExit=yes
       ExecStart=/usr/local/bin/relay-start.sh
       ExecStop=/usr/bin/docker stop stream-relay
+      # A transient failure (Key Vault RBAC still propagating, ACR token refresh) should
+      # heal itself rather than leaving the relay down until someone notices.
+      Restart=on-failure
+      RestartSec=30
       [Install]
       WantedBy=multi-user.target
 
@@ -207,9 +224,12 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
       adminUsername: adminUsername
       customData: base64(renderedCloudInit)
       linuxConfiguration: {
-        // Password auth is always off. If no SSH key is supplied there is no inbound
-        // administrative path at all, which is the intended posture for a box on a public
-        // IP; use Azure Run Command or the Serial Console instead.
+        // Password auth is always off. Azure then REQUIRES an SSH key - it rejects a Linux
+        // profile with neither ("Authentication using either SSH or by user name and
+        // password must be enabled in Linux profile"), so the intended posture of no
+        // administrative auth at all cannot be expressed. deploy.sh therefore supplies an
+        // ephemeral public key whose private half is discarded. The NSG opens no SSH port,
+        // so there is no network path to it either way.
         disablePasswordAuthentication: true
         ssh: empty(sshPublicKey)
           ? null

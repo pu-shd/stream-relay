@@ -274,6 +274,30 @@ deploy_bicep() {
   local operator_oid
   operator_oid=$(az_query ad signed-in-user show --query id -o tsv || echo "")
 
+  # Azure REQUIRES a Linux VM to have either a password or an SSH key:
+  #   InvalidParameter linuxConfiguration:
+  #   "Authentication using either SSH or by user name and password must be enabled"
+  # The intended posture - no inbound administrative path whatsoever - is therefore not
+  # expressible. Closest equivalent: generate an EPHEMERAL keypair, hand Azure the public
+  # half, and discard the private half. The NSG has no SSH rule, so there is no network path
+  # to the port regardless; and because nobody holds the private key, opening that port by
+  # accident still grants nobody access.
+  #
+  # Set SSH_PUBLIC_KEY yourself if you want a real break-glass path. Recovery otherwise is
+  # Azure Run Command (RBAC-gated), or delete-and-redeploy - the VM is disposable by design:
+  # its config comes from the config repo and its secret from Key Vault.
+  if [ -z "${SSH_PUBLIC_KEY:-}" ]; then
+    local ephemeral_key
+    ephemeral_key=$(mktemp -u)
+    ssh-keygen -t ed25519 -N '' -C 'stream-relay-ephemeral-discarded' -f "$ephemeral_key" >/dev/null 2>&1
+    SSH_PUBLIC_KEY=$(cat "${ephemeral_key}.pub")
+    shred -u "$ephemeral_key" 2>/dev/null || rm -f "$ephemeral_key"
+    rm -f "${ephemeral_key}.pub"
+    info "generated an ephemeral SSH key and discarded the private half"
+    detail "Azure requires some Linux auth method; the NSG exposes no SSH port."
+    detail "Set SSH_PUBLIC_KEY to keep a break-glass path instead."
+  fi
+
   # deployRoleAssignments defaults to false in the generated .bicepparam; only an explicit
   # bootstrap run overrides it to true.
   local rbac_param=()
@@ -385,11 +409,56 @@ do_configure-vm() {
   # Run Command rather than SSH: there is no inbound SSH rule in the NSG by design.
   local encoded
   encoded=$(base64 < "$tmpl" | tr -d '\n')
-  az_do vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
+
+  # Wait for cloud-init BEFORE touching the service. Starting it early raced cloud-init's
+  # Azure CLI install and died with "az: command not found", while this step still reported
+  # success - a deployment that looks green with the relay down.
+  info "waiting for cloud-init to finish on the VM (docker + az install)"
+  local ci_status=""
+  local _i
+  for _i in $(seq 1 40); do
+    ci_status=$(az_query vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
+      --command-id RunShellScript --scripts "cloud-init status 2>/dev/null | head -1" \
+      --query "value[0].message" -o tsv 2>/dev/null | grep -o 'status: [a-z]*' | head -1 || true)
+    case "$ci_status" in
+      *done|*disabled) break ;;
+      *error) die "cloud-init failed on the VM; inspect with:
+    az vm run-command invoke -g $AZ_RESOURCE_GROUP -n $AZ_VM_NAME --command-id RunShellScript \\
+      --scripts 'cloud-init status --long; journalctl -u cloud-final --no-pager | tail -40'" ;;
+    esac
+    sleep 15
+  done
+  unset _i
+  ok "cloud-init: ${ci_status:-unknown}"
+
+  # Run Command rather than SSH: there is no inbound SSH rule in the NSG by design.
+  local result
+  result=$(az vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
     --command-id RunShellScript \
-    --scripts "mkdir -p /etc/stream-relay/config && echo '$encoded' | base64 -d > /etc/stream-relay/config/mediamtx.yml.tmpl && systemctl restart stream-relay.service && sleep 5 && docker ps --filter name=stream-relay --format '{{.Status}}'" \
-    -o none
-  ok "config delivered and service restarted"
+    --scripts "set -e
+mkdir -p /etc/stream-relay/config
+echo '$encoded' | base64 -d > /etc/stream-relay/config/mediamtx.yml.tmpl
+systemctl restart stream-relay.service || true
+for i in \$(seq 1 24); do
+  if docker ps --filter name=stream-relay --filter health=healthy --format '{{.Names}}' | grep -q stream-relay; then
+    echo RELAY_HEALTHY; break
+  fi
+  sleep 5
+done
+echo \"service=\$(systemctl is-active stream-relay)\"
+docker ps --filter name=stream-relay --format '{{.Status}}' || true
+journalctl -u stream-relay --no-pager -n 12 2>&1 | tail -12" \
+    --query "value[0].message" -o tsv 2>&1)
+
+  if grep -q 'RELAY_HEALTHY' <<<"$result"; then
+    ok "config delivered; MediaMTX container is healthy"
+    return 0
+  fi
+
+  fail "the relay did not become healthy after config delivery"
+  printf '%s\n' "$result" | sed 's/^/      /' >&2
+  die "configure-vm failed. Common causes: Key Vault RBAC still propagating (retry the step),
+    or the image tag missing from ACR (re-run --step build-push-image)."
 }
 
 do_discover-hostname() {

@@ -51,25 +51,36 @@ resource vmIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31
 // environment form REPLACES the ref form rather than adding to it - so a job declaring
 // `environment: production` needs the environment credential, and a job without one needs
 // the ref credential. Both are required; neither is redundant.
-resource branchCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [
-  for branch in allowedBranches: {
-    parent: ciIdentity
+//
+// SERIALIZED ON PURPOSE. Azure rejects concurrent federated-credential writes under one
+// managed identity:
+//
+//   ConcurrentFederatedIdentityCredentialsWritesForSingleManagedIdentity
+//   "Concurrent Federated Identity Credentials writes under the same managed identity are
+//    not supported."
+//
+// Two separate resource loops deployed in parallel and hit exactly that. Flattening them
+// into a single loop with @batchSize(1) forces ARM to create them one at a time. Do not
+// split this back into per-kind loops, and do not remove the decorator.
+var federatedSubjects = concat(
+  map(allowedBranches, branch => {
     name: 'gh-branch-${replace(branch, '/', '-')}'
-    properties: {
-      issuer: 'https://token.actions.githubusercontent.com'
-      subject: 'repo:${githubOwner}/${githubConfigRepo}:ref:refs/heads/${branch}'
-      audiences: ['api://AzureADTokenExchange']
-    }
-  }
-]
-
-resource environmentCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [
-  for env in allowedEnvironments: {
-    parent: ciIdentity
+    subject: 'repo:${githubOwner}/${githubConfigRepo}:ref:refs/heads/${branch}'
+  }),
+  map(allowedEnvironments, env => {
     name: 'gh-env-${env}'
+    subject: 'repo:${githubOwner}/${githubConfigRepo}:environment:${env}'
+  })
+)
+
+@batchSize(1)
+resource federatedCredentials 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = [
+  for fic in federatedSubjects: {
+    parent: ciIdentity
+    name: fic.name
     properties: {
       issuer: 'https://token.actions.githubusercontent.com'
-      subject: 'repo:${githubOwner}/${githubConfigRepo}:environment:${env}'
+      subject: fic.subject
       audiences: ['api://AzureADTokenExchange']
     }
   }
