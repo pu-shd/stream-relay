@@ -17,3 +17,4 @@ mediamtx.yml
 .what-if.json
 .validate.json
 .restrict-history
+infra/main.json

@@ -17,8 +17,13 @@ MOCK_AZ_SCENARIO="${MOCK_AZ_SCENARIO:-fresh}"
 printf '%s\n' "$*" >> "$MOCK_AZ_LOG"
 
 # Which resources "exist" in this scenario. `fresh` = nothing; `existing` = everything;
-# `partial` = up to the network step; `cdn-unregistered` mirrors the real ORFE subscription.
+# `partial` = up to the infra step; `provider-unregistered` mirrors a subscription where a
+# needed provider is NotRegistered.
 resource_exists() {
+  # The resource group ALWAYS exists. This deployment adopts a shared group it did not
+  # create and refuses to invent one, so "absent" is a fatal misconfiguration rather than a
+  # state any scenario should model.
+  [ "$1" = "group" ] && return 0
   case "$MOCK_AZ_SCENARIO" in
     # orphaned-disk models "everything existed, teardown ran, but a disk survived", so the
     # resources must exist or teardown exits early and never reaches the orphan check.
@@ -89,9 +94,9 @@ case "$1 ${2:-} ${3:-} ${4:-}" in
     for ((i = 1; i <= $#; i++)); do
       [ "${!i}" = "-n" ] && { j=$((i + 1)); ns="${!j}"; }
     done
-    # Microsoft.Cdn is NotRegistered in the scenario that mirrors reality, so the test can
+    # Microsoft.Consumption stands in for any NotRegistered provider, so the test can
     # assert step 2 actually registers it rather than failing later at Front Door.
-    if [ "$MOCK_AZ_SCENARIO" = "cdn-unregistered" ] && [ "$ns" = "Microsoft.Cdn" ]; then
+    if [ "$MOCK_AZ_SCENARIO" = "provider-unregistered" ] && [ "$ns" = "Microsoft.Consumption" ]; then
       if [ -f "${MOCK_AZ_STATE_DIR:-/tmp}/cdn-registered" ]; then
         emit 'Registered'
       else
@@ -213,6 +218,16 @@ Up 10 seconds (healthy)'
     resource_exists network || exit 1 ;;
   "network public-ip show"*) resource_exists network || exit 1 ;;
   "network nsg rule update"*) ;;
+  # The relay's own rule. Present whenever the deployment is, so teardown has something to
+  # remove; the HTTPS and ACME rules are deliberately NOT modelled as removable, because
+  # teardown must never touch them.
+  "network nsg rule show"*)
+    case "$*" in
+      *AllowSrtIngest*) resource_exists nsg-rule && emit '{"name":"AllowSrtIngest"}' || exit 1 ;;
+      *) exit 1 ;;
+    esac ;;
+  "network nsg rule delete"*) ;;
+  "network nsg rule list"*) emit '[]' ;;
   "network nsg delete"*|"network vnet delete"*|"network nic delete"*|"network public-ip delete"*) ;;
   "network front-door waf-policy show"*) resource_exists frontdoor || exit 1 ;;
   "network front-door waf-policy delete"*) ;;

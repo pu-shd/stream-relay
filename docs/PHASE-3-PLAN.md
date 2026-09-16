@@ -76,8 +76,8 @@ redundant:
 
 | Subject | Sent when |
 | :--- | :--- |
-| `repo:pu-orfe/stream-relay-config:environment:production` | a job declares `environment: production` |
-| `repo:pu-orfe/stream-relay-config:ref:refs/heads/main` | a job on `main` with **no** environment |
+| `repo:pu-shd/stream-relay-config:environment:production` | a job declares `environment: production` |
+| `repo:pu-shd/stream-relay-config:ref:refs/heads/main` | a job on `main` with **no** environment |
 
 GitHub sends exactly one `sub` per job, and the environment form **replaces** the ref form
 rather than adding to it. The deploy job uses the environment (so it inherits the reviewer

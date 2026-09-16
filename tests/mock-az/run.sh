@@ -118,7 +118,7 @@ fi
 # --- 0. plumbing ------------------------------------------------------------------------
 step_header 1 8 "Step list and argument validation"
 out=$(run_deploy fresh --list-steps)
-expected_steps=17
+expected_steps=7
 [ "$(grep -cE '^ +[0-9]+\. ' <<<"$out")" -eq "$expected_steps" ] \
   && t_ok "$expected_steps steps declared" \
   || t_fail "expected $expected_steps steps, got: $(grep -cE '^ +[0-9]+\. ' <<<"$out")"
@@ -154,7 +154,9 @@ first_mutations=$(mutating_calls)
   || t_fail "a fresh run should have mutated something"
 
 done_count=$(jq -r '[.steps[] | select(.status=="done")] | length' "$SANDBOX/state.json")
-[ "$done_count" -eq 17 ] && t_ok "all 17 steps recorded done" || t_fail "only $done_count steps recorded done"
+# Seven, not seventeen: ten steps were retired with the CDN delivery plane, the custom
+# image and the resources this deployment now adopts rather than creates.
+[ "$done_count" -eq 7 ] && t_ok "all 7 steps recorded done" || t_fail "only $done_count steps recorded done"
 
 # --- 3. idempotency ---------------------------------------------------------------------
 step_header 4 8 "Idempotency: everything already exists"
@@ -273,20 +275,20 @@ else
 fi
 
 reset_state; reset_log
-out=$(run_deploy cdn-unregistered --step register-providers)
+out=$(run_deploy provider-unregistered --step register-providers)
 if grep -q 'provider register' "$SANDBOX/az.log"; then
-  t_ok "an unregistered Microsoft.Cdn is registered at step 2, not discovered at step 12"
+  t_ok "an unregistered provider is registered up front, not discovered mid-deploy"
 else
   t_fail "register-providers did not register the unregistered provider"
 fi
 
 # A healthy MediaMTX with a dead mirror delivers nothing, so it must fail the step.
 reset_state; reset_log
-out=$(run_deploy mirror-down --step configure-vm)
+out=$(run_deploy mirror-down --step configure)
 if [ $? -ne 0 ] && grep -q "mirror" <<<"$out"; then
-  t_ok "a dead HLS mirror fails configure-vm even when MediaMTX is healthy"
+  t_ok "a dead HLS mirror fails configure even when MediaMTX is healthy"
 else
-  t_fail "configure-vm passed with the mirror down:\n$out"
+  t_fail "configure passed with the mirror down:\n$out"
 fi
 
 # --- 6. secret hygiene ------------------------------------------------------------------
@@ -315,48 +317,93 @@ MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=existing \
 rc=$?
 [ "$rc" -eq 0 ] && t_ok "selective teardown succeeded" || { t_fail "selective teardown failed:"; sed 's/^/      /' "$SANDBOX/teardown.out"; }
 
-fd_line=$(grep -n 'afd profile delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
-vm_line=$(grep -n 'vm delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
-nic_line=$(grep -n 'network nic delete' "$SANDBOX/az.log" | head -1 | cut -d: -f1)
-if [ -n "$fd_line" ] && [ -n "$vm_line" ] && [ "$fd_line" -lt "$vm_line" ]; then
-  t_ok "Front Door deleted before the VM"
+# ---------------------------------------------------------------------------------------
+# Teardown must delete ONLY what the relay created.
+#
+# Everything the relay runs on is adopted: the VM, its NIC, vnet, subnet, NSG, static public
+# IP, Key Vault and disks all existed first. The previous version of this path deleted all
+# of them - correct when the deployment created them, catastrophic now. These assertions are
+# about absence, because absence is the whole property.
+# ---------------------------------------------------------------------------------------
+protected_hit=""
+for pat in 'vm delete' 'network nic delete' 'network vnet delete' 'network nsg delete' \
+           'network public-ip delete' 'keyvault delete' 'keyvault purge' \
+           'storage account delete' 'acr delete'; do
+  grep -qE "(^| )$pat" "$SANDBOX/az.log" && protected_hit="$protected_hit $pat"
+done
+if [ -z "$protected_hit" ]; then
+  t_ok "teardown deleted no adopted resource (VM, NIC, vnet, NSG, IP, vault, storage)"
 else
-  t_fail "teardown order wrong: front-door=$fd_line vm=$vm_line"
-fi
-# The NIC must be deleted AFTER the VM and BEFORE any subnet work, or Azure rejects it
-# with InUseSubnetCannotBeDeleted.
-if [ -n "$vm_line" ] && [ -n "$nic_line" ] && [ "$vm_line" -lt "$nic_line" ]; then
-  t_ok "VM deleted before its NIC"
-else
-  t_fail "teardown order wrong: vm=$vm_line nic=$nic_line"
+  t_fail "teardown deleted adopted resources:$protected_hit"
 fi
 
-# The static public IP and the vnet must SURVIVE --soft: publishers embed that IP, so
-# releasing it breaks every producer on the next activation.
-if grep -qE 'network public-ip delete' "$SANDBOX/az.log"; then
-  t_fail "--keep-ip deleted the public IP"
+# The SRT rule is the relay's own, so it goes.
+if grep -qE 'nsg rule delete.*AllowSrtIngest' "$SANDBOX/az.log"; then
+  t_ok "the SRT ingest rule was removed"
 else
-  t_ok "--keep-ip preserved the static ingest address"
+  t_fail "AllowSrtIngest was not removed"
 fi
-if grep -qE '(^| )acr delete' "$SANDBOX/az.log"; then
-  t_fail "--keep-registry did not preserve the registry"
-else
-  t_ok "--keep-registry preserved the container registry"
-fi
-grep -q 'no unexpected billable resources remain' "$SANDBOX/teardown.out" \
-  && t_ok "teardown confirmed no billable resources remain" \
-  || t_fail "teardown did not confirm the absence of billable resources"
 
-# An orphaned disk is a silent monthly charge; teardown must report it, not shrug.
-reset_log
-MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=orphaned-disk \
-  PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
-  STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
-  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes >"$SANDBOX/teardown2.out" 2>&1
-if [ $? -ne 0 ] && grep -q 'still billable' "$SANDBOX/teardown2.out"; then
-  t_ok "an orphaned disk is reported and exits non-zero"
+# 443 and 80 are NOT the relay's to remove: VDO.Ninja at /meet/ serves on 443, and certbot
+# renews over 80. Deleting either takes down a service the relay never owned.
+if grep -qE 'nsg rule delete.*(AllowHlsDelivery|AllowAcmeHttp)' "$SANDBOX/az.log"; then
+  t_fail "teardown removed the HTTPS or ACME rule; VDO.Ninja and renewal need both"
 else
-  t_fail "orphaned billable resources were not surfaced"
+  t_ok "the HTTPS and ACME rules were left alone"
+fi
+
+grep -q 'adopted VM and its services are untouched' "$SANDBOX/teardown.out" \
+  && t_ok "teardown states plainly what it left behind" \
+  || t_fail "teardown did not report what survived"
+
+# ---------------------------------------------------------------------------------------
+# The shared-resource-group guard.
+#
+# orfe-dept-azure-rg is not dedicated to the relay: it holds orfe-web-vm, that VM's Key
+# Vault, vnet, disks and alerts. `az group delete` there destroys a VM somebody parked, and
+# purging the vault destroys secrets belonging to it. Both are irreversible, so both are
+# asserted here rather than trusted to a comment.
+# ---------------------------------------------------------------------------------------
+guard_config() {
+  local dir="$SANDBOX/guard/orfe" flag="$1"
+  rm -rf "$SANDBOX/guard"; mkdir -p "$dir"
+  grep -v '^SHARED_RESOURCE_GROUP=' "$CONFIG/orfe/deploy.env" > "$dir/deploy.env"
+  [ -n "$flag" ] && printf 'SHARED_RESOURCE_GROUP=%s\n' "$flag" >> "$dir/deploy.env"
+  printf '%s' "$SANDBOX/guard"
+}
+
+run_teardown() {
+  reset_log
+  MOCK_AZ_LOG="$SANDBOX/az.log" PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$1" \
+    STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
+    "$REPO_ROOT/scripts/teardown.sh" --yes >"$SANDBOX/guard.out" 2>&1
+  return $?
+}
+
+run_teardown "$(guard_config true)"
+if grep -q 'refusing to delete' "$SANDBOX/guard.out" \
+   && ! grep -qE '(^| )group delete' "$SANDBOX/az.log"; then
+  t_ok "complete teardown refuses a shared resource group"
+else
+  t_fail "complete teardown did NOT refuse a shared resource group"
+fi
+
+# Fails closed: an older deploy.env predating the flag must not be read as "dedicated".
+run_teardown "$(guard_config "")"
+if grep -q 'refusing to delete' "$SANDBOX/guard.out" \
+   && ! grep -qE '(^| )group delete' "$SANDBOX/az.log"; then
+  t_ok "a missing SHARED_RESOURCE_GROUP flag fails closed"
+else
+  t_fail "a missing SHARED_RESOURCE_GROUP flag did NOT fail closed"
+fi
+
+# A vault the relay did not create is never purged, even when the group IS dedicated -
+# the two guards are independent.
+run_teardown "$(guard_config false)"
+if ! grep -qE '(^| )keyvault purge' "$SANDBOX/az.log"; then
+  t_ok "a Key Vault the relay does not own is never purged"
+else
+  t_fail "teardown purged a Key Vault the relay does not own"
 fi
 
 printf "\n"

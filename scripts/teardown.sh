@@ -68,6 +68,27 @@ set +a
 source "$REPO_ROOT/scripts/lib/state.sh"
 
 SELECTIVE=$(( KEEP_IP + KEEP_REGISTRY ))
+
+# ---------------------------------------------------------------------------------------
+# HARD GUARD: a shared resource group must never be deleted.
+#
+# orfe-dept-azure-rg is not dedicated to the relay. It holds orfe-web-vm, that VM's Key
+# Vault, its vnet, disks, disk-encryption set, Log Analytics workspace and alert rules -
+# none of which this project created. Deleting the group, or purging a vault the relay does
+# not own, destroys all of it.
+#
+# Fails CLOSED: an unset flag is treated as shared. A teardown that refuses too often costs
+# a manual cleanup; one that deletes too much costs a VM somebody parked for a reason.
+# ---------------------------------------------------------------------------------------
+if [ "${SHARED_RESOURCE_GROUP:-true}" != "false" ] && [ "$SELECTIVE" -eq 0 ]; then
+  die "refusing to delete $AZ_RESOURCE_GROUP: SHARED_RESOURCE_GROUP is not false.
+
+  That group holds resources this project did not create. Complete teardown would take
+  them with it.
+
+  Use --selective, which removes only the relay's own resources by name." 2
+fi
+
 if [ "$SELECTIVE" -eq 0 ]; then
   banner "STREAM-RELAY TEARDOWN — COMPLETE"
 else
@@ -127,6 +148,12 @@ KV_LOCATION="${AZ_REGION:-}"
 # would strand a reactivation. Purge protection is deliberately off in keyvault.bicep so
 # this is possible.
 purge_vault() {
+  # RELAY_OWNS_KEY_VAULT=false means this vault was created with the VM and is reused. A
+  # purge would destroy secrets belonging to something else and cannot be undone.
+  if [ "${RELAY_OWNS_KEY_VAULT:-false}" != "true" ]; then
+    skipped "$KV_NAME is not owned by the relay - not purging"
+    return 0
+  fi
   [ -n "$KV_NAME" ] || return 0
   if az keyvault list-deleted --query "[?name=='$KV_NAME']" -o tsv 2>/dev/null | grep -q .; then
     run keyvault purge --name "$KV_NAME" --location "$KV_LOCATION" \
@@ -139,6 +166,8 @@ purge_vault() {
 
 # ---------------------------------------------------------------------------------------
 # Path A: complete. Delete the group, then purge the vault.
+#
+# Only reachable when the group is dedicated to the relay (SHARED_RESOURCE_GROUP=false).
 # ---------------------------------------------------------------------------------------
 if [ "$SELECTIVE" -eq 0 ]; then
   step_header 1 3 "Deleting the resource group"
@@ -170,107 +199,69 @@ if [ "$SELECTIVE" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------------------
-# Path B: selective. Delete resource by resource, honouring the --keep-* flags.
-# Order matters: Front Door before the VM (nothing should route to a vanishing origin), the
-# VM before its NIC, and the NIC before anything touching the subnet.
+# Path B: selective — the only path that runs against a shared, adopted deployment.
+#
+# THIS DELETES ONLY WHAT THE RELAY CREATED.
+#
+# Everything the relay runs on was already here and is adopted: the VM, its NIC, vnet,
+# subnet, NSG, static public IP, Key Vault, disks, disk-encryption set, Log Analytics
+# workspace and alert rules. An earlier version of this path deleted all of those, which
+# was correct when the deployment created them and would now destroy orfe-web-vm, its
+# certificate lineage and the VDO.Ninja install beside it.
+#
+# It also leaves the :443 and :80 NSG rules alone. They predate the relay in spirit - the
+# VM served HTTPS before - and VDO.Ninja at /meet/ still needs both, the second for ACME.
+# Only the SRT ingest rule is the relay's own.
 # ---------------------------------------------------------------------------------------
-step_header 1 6 "Front Door and WAF"
-if az afd profile show -g "$AZ_RESOURCE_GROUP" --profile-name "$AZ_FRONTDOOR_PROFILE" >/dev/null 2>&1; then
-  # NOTE: `az afd profile delete` has no --yes flag; passing it errors.
-  run afd profile delete -g "$AZ_RESOURCE_GROUP" --profile-name "$AZ_FRONTDOOR_PROFILE"
-  ok "deleted $AZ_FRONTDOOR_PROFILE"
+step_header 1 5 "Relay containers on the VM"
+if [ "$DRY_RUN" = "1" ]; then
+  skipped "[dry-run] would stop and remove the mediamtx container"
 else
-  skipped "no Front Door profile"
-fi
-waf="${AZ_FRONTDOOR_PROFILE//-/}waf"
-if az network front-door waf-policy show -g "$AZ_RESOURCE_GROUP" -n "$waf" >/dev/null 2>&1; then
-  run network front-door waf-policy delete -g "$AZ_RESOURCE_GROUP" -n "$waf"
-  ok "deleted $waf"
-else
-  skipped "no WAF policy"
-fi
-
-step_header 2 6 "Virtual machine"
-if az vm show -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" >/dev/null 2>&1; then
-  run vm delete -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" --yes
-  ok "deleted $AZ_VM_NAME (OS disk follows: deleteOption=Delete)"
-else
-  skipped "no VM"
-fi
-# The NIC must go before any subnet work or Azure returns InUseSubnetCannotBeDeleted.
-if az network nic show -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME}-nic" >/dev/null 2>&1; then
-  run network nic delete -g "$AZ_RESOURCE_GROUP" -n "${AZ_VM_NAME}-nic"
-  ok "deleted NIC"
-fi
-
-step_header 3 6 "Network"
-if az network vnet show -g "$AZ_RESOURCE_GROUP" -n relay-vnet >/dev/null 2>&1; then
-  run network vnet delete -g "$AZ_RESOURCE_GROUP" -n relay-vnet && ok "deleted relay-vnet" \
-    || warn "could not delete relay-vnet"
-fi
-if az network nsg show -g "$AZ_RESOURCE_GROUP" -n "${AZ_NSG_NAME:-relay-nsg}" >/dev/null 2>&1; then
-  run network nsg delete -g "$AZ_RESOURCE_GROUP" -n "${AZ_NSG_NAME:-relay-nsg}" \
-    && ok "deleted NSG" || warn "could not delete the NSG"
-fi
-if [ "$KEEP_IP" = "1" ]; then
-  skipped "keeping relay-pip so the ingest address survives reactivation"
-elif az network public-ip show -g "$AZ_RESOURCE_GROUP" -n relay-pip >/dev/null 2>&1; then
-  run network public-ip delete -g "$AZ_RESOURCE_GROUP" -n relay-pip && ok "deleted relay-pip" \
-    || warn "could not delete relay-pip"
-fi
-
-step_header 4 6 "Container registry and storage"
-if [ "$KEEP_REGISTRY" = "1" ]; then
-  skipped "keeping $AZ_ACR_NAME so reactivation needs no image build"
-elif az acr show -n "$AZ_ACR_NAME" -g "$AZ_RESOURCE_GROUP" >/dev/null 2>&1; then
-  run acr delete -n "$AZ_ACR_NAME" -g "$AZ_RESOURCE_GROUP" --yes && ok "deleted $AZ_ACR_NAME"
-else
-  skipped "no registry"
-fi
-if [ -n "${AZ_STORAGE_ACCOUNT:-}" ] \
-  && az storage account show -n "$AZ_STORAGE_ACCOUNT" -g "$AZ_RESOURCE_GROUP" >/dev/null 2>&1; then
-  run storage account delete -n "$AZ_STORAGE_ACCOUNT" -g "$AZ_RESOURCE_GROUP" --yes \
-    && ok "deleted $AZ_STORAGE_ACCOUNT (HLS delivery origin)"
-fi
-
-step_header 5 6 "Key Vault and identities"
-if [ -n "$KV_NAME" ] && az keyvault show -n "$KV_NAME" -g "$AZ_RESOURCE_GROUP" >/dev/null 2>&1; then
-  run keyvault delete -n "$KV_NAME" -g "$AZ_RESOURCE_GROUP" && ok "deleted $KV_NAME"
-  [ "$DRY_RUN" = "1" ] || purge_vault
-fi
-for ident in "${AZ_IDENTITY_CI:-}" "${AZ_IDENTITY_VM:-}"; do
-  [ -n "$ident" ] || continue
-  if az identity show -g "$AZ_RESOURCE_GROUP" -n "$ident" >/dev/null 2>&1; then
-    run identity delete -g "$AZ_RESOURCE_GROUP" -n "$ident" && ok "deleted $ident"
+  if az vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
+       --command-id RunShellScript --scripts 'docker rm -f stream-relay >/dev/null 2>&1 || true; echo stopped' \
+       >/dev/null 2>&1; then
+    ok "stopped the relay container (nginx and certbot left running for /meet/)"
+  else
+    warn "could not reach the VM to stop the relay container"
   fi
-done
+fi
 
-step_header 6 6 "Confirming"
-printf "\n${BOLD}Remaining:${NC}\n"
+step_header 2 5 "SRT ingest rule"
+if az network nsg rule show -g "$AZ_RESOURCE_GROUP" --nsg-name "${AZ_NSG_NAME:-${AZ_VM_NAME}-nsg}" \
+     -n AllowSrtIngest >/dev/null 2>&1; then
+  run network nsg rule delete -g "$AZ_RESOURCE_GROUP" \
+    --nsg-name "${AZ_NSG_NAME:-${AZ_VM_NAME}-nsg}" -n AllowSrtIngest \
+    && ok "removed AllowSrtIngest (443 and 80 retained: VDO.Ninja and ACME need them)"
+else
+  skipped "no SRT ingest rule"
+fi
+
+step_header 3 5 "Budget"
+if az consumption budget show --budget-name relay-budget >/dev/null 2>&1; then
+  run consumption budget delete --budget-name relay-budget && ok "deleted the budget"
+else
+  skipped "no budget"
+fi
+
+step_header 4 5 "CI identity"
+# The VM's identity is SystemAssigned and belongs to the VM, so it is never touched here.
+if [ -n "${AZ_IDENTITY_CI:-}" ] \
+   && az identity show -g "$AZ_RESOURCE_GROUP" -n "$AZ_IDENTITY_CI" >/dev/null 2>&1; then
+  run identity delete -g "$AZ_RESOURCE_GROUP" -n "$AZ_IDENTITY_CI" \
+    && ok "deleted $AZ_IDENTITY_CI (federated credentials go with it)"
+else
+  skipped "no CI identity"
+fi
+
+step_header 5 5 "Confirming what remains"
+printf "\n${BOLD}Still present (adopted, deliberately untouched):${NC}\n"
 az resource list -g "$AZ_RESOURCE_GROUP" --query "[].{name:name, type:type}" -o table | sed 's/^/  /'
 
 if [ "$DRY_RUN" = "1" ]; then
   printf "\n"; info "[dry-run] nothing was deleted"; exit 0
 fi
 
-# Report anything hourly-billable that survived. An orphaned disk or VM is a silent monthly
-# charge, and this is exactly where it would hide.
-query="[?type=='Microsoft.Compute/disks' || type=='Microsoft.Compute/virtualMachines' || type=='Microsoft.Network/networkInterfaces'"
-[ "$KEEP_IP" = "1" ]       || query="$query || type=='Microsoft.Network/publicIPAddresses'"
-[ "$KEEP_REGISTRY" = "1" ] || query="$query || type=='Microsoft.ContainerRegistry/registries'"
-query="$query].name"
-unexpected=$(az resource list -g "$AZ_RESOURCE_GROUP" --query "$query" -o tsv)
 printf "\n"
-if [ -n "$unexpected" ]; then
-  warn "these should have been removed and are still billable:"
-  while IFS= read -r r; do warn "  $r"; done <<< "$unexpected"
-  exit 1
-fi
-ok "no unexpected billable resources remain"
-if [ "$KEEP_IP" = "1" ]; then
-  info "ingest IP retained — producer URLs keep working"
-else
-  warn "ingest IP released — re-render producer URLs after reactivation"
-fi
-warn "SRT passphrase was purged with the vault — it is regenerated on the next deploy"
-info "reactivate with: scripts/bootstrap.sh --with-role-assignments"
+ok "relay resources removed; the adopted VM and its services are untouched"
+info "the SRT passphrase remains in $KV_NAME - the relay reuses it on the next deploy"
+info "reactivate with: scripts/deploy.sh"

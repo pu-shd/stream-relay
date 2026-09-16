@@ -253,8 +253,8 @@ Mirrors `page-stream` / `page-stream-config` in shape, so the idioms transfer.
 
 | Repo | Contents |
 | :--- | :--- |
-| **`pu-orfe/stream-relay`** (this repo) | The engine. Bicep IaC, scripts, MediaMTX Dockerfile, local compose stack, engine tests. Department-agnostic — no ORFE specifics, no resource names. |
-| **`pu-orfe/stream-relay-config`** | The deployment. `<dept>/relay.yml` (the only file anyone edits), generated `mediamtx.yml` / `deploy.env` / `ingest-urls.env` / `infra.bicepparam`, GitOps workflows, validation suite. |
+| **`pu-shd/stream-relay`** (this repo) | The engine. Bicep IaC, scripts, MediaMTX Dockerfile, local compose stack, engine tests. Department-agnostic — no ORFE specifics, no resource names. |
+| **`pu-shd/stream-relay-config`** | The deployment. `<dept>/relay.yml` (the only file anyone edits), generated `mediamtx.yml` / `deploy.env` / `ingest-urls.env` / `infra.bicepparam`, GitOps workflows, validation suite. |
 
 Both are private. The split is structural, not a visibility boundary.
 

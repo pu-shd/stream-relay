@@ -52,7 +52,7 @@ step_header 2 6 "Locating configuration"
 if [ ! -d "$CONFIG_REPO/$DEPT" ]; then
   fail "no config found at $CONFIG_REPO/$DEPT"
   info "clone it beside this repo:"
-  detail "git clone git@github.com:pu-orfe/stream-relay-config.git $CONFIG_REPO"
+  detail "git clone git@github.com:pu-shd/stream-relay-config.git $CONFIG_REPO"
   exit 1
 fi
 ok "config repo: $CONFIG_REPO"

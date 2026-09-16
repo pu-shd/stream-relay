@@ -12,45 +12,33 @@
 #
 # The mock-az suite asserts all three.
 
+# Seven steps, down from seventeen.
+#
+# Ten were retired when the topology changed, not merely disabled: storage, front-door,
+# discover-hostname and custom-domain belonged to a CDN delivery plane that no longer
+# exists; acr and build-push-image to a custom image replaced by the upstream one with a
+# bind-mounted entrypoint; identity, federated-credential, network and vm to resources this
+# deployment now ADOPTS rather than creates. Their work is either gone or folded into the
+# single Bicep deployment, which is idempotent on its own.
 STEPS=(
   preflight
   register-providers
   resource-group
-  identity
-  federated-credential
-  key-vault
-  acr
-  storage
-  build-push-image
-  network
-  vm
-  configure-vm
-  front-door
-  discover-hostname
-  guardrails
-  custom-domain
+  passphrase
+  infra
+  configure
   verify
 )
 
 step_description() {
   case "$1" in
-    preflight)            echo "Check tooling, login, role, quota and providers" ;;
-    register-providers)   echo "Register Microsoft.Cdn and friends" ;;
-    resource-group)       echo "Create the resource group" ;;
-    identity)             echo "Create the user-assigned managed identity" ;;
-    federated-credential) echo "Trust GitHub Actions via OIDC (no secret)" ;;
-    key-vault)            echo "Create the vault and store the SRT passphrase" ;;
-    acr)                  echo "Create the registry and grant pull to the identity" ;;
-    storage)              echo "Enable static-website hosting on the delivery account" ;;
-    build-push-image)     echo "Build the relay image and push it to ACR" ;;
-    network)              echo "Create vnet, NSG and the STATIC public IP" ;;
-    vm)                   echo "Create the relay VM with its managed identity" ;;
-    configure-vm)         echo "Deliver the config template and start MediaMTX" ;;
-    front-door)           echo "Create Front Door, cache rules and the WAF rate limit" ;;
-    discover-hostname)    echo "Read the real hostname and write it into relay.yml" ;;
-    guardrails)           echo "Provision the budget and forecast alerts" ;;
-    custom-domain)        echo "Add the custom domain and print the DNS request" ;;
-    verify)               echo "Assert the deployment end to end" ;;
+    preflight)          echo "Check tooling, login and role" ;;
+    register-providers) echo "Register the resource providers this deployment uses" ;;
+    resource-group)     echo "Confirm the resource group exists (never creates: it is shared)" ;;
+    passphrase)         echo "Ensure the SRT passphrase exists in Key Vault" ;;
+    infra)              echo "Deploy the NSG rules and the budget" ;;
+    configure)          echo "Render the relay config on the VM and bring the stack up" ;;
+    verify)             echo "Assert the deployment end to end" ;;
   esac
 }
 
@@ -190,10 +178,10 @@ do_preflight() {
 }
 
 do_register-providers() {
-  # Microsoft.Cdn was NotRegistered on ORFE-dept-azure. Without this step the whole
-  # deployment runs to step 12 and then fails on Front Door.
-  local needed=(Microsoft.Cdn Microsoft.Compute Microsoft.Network Microsoft.KeyVault
-                Microsoft.ManagedIdentity Microsoft.ContainerRegistry Microsoft.Consumption)
+  # Microsoft.Cdn and Microsoft.ContainerRegistry are no longer here: Front Door and ACR
+  # were both retired with the delivery-plane change.
+  local needed=(Microsoft.Compute Microsoft.Network Microsoft.KeyVault
+                Microsoft.ManagedIdentity Microsoft.Consumption)
   local to_register=()
   for ns in "${needed[@]}"; do
     local st
@@ -227,84 +215,38 @@ do_register-providers() {
 }
 
 do_resource-group() {
-  require_env AZ_RESOURCE_GROUP AZ_REGION
+  require_env AZ_RESOURCE_GROUP
+  # CONFIRMS. Never creates, and never deletes.
+  #
+  # orfe-dept-azure-rg is shared: it holds orfe-web-vm, that VM's Key Vault, vnet, disks and
+  # alert rules, none of which this project created. An earlier version of this step created
+  # the group when absent, which was right when the group was dedicated and is wrong now -
+  # a missing group here means the config points somewhere unexpected, and inventing it
+  # would scatter relay resources into a group nobody meant.
   if [ "$(az_query group exists -n "$AZ_RESOURCE_GROUP")" = "true" ]; then
-    skipped "resource group $AZ_RESOURCE_GROUP already exists"
+    ok "resource group $AZ_RESOURCE_GROUP exists"
     return 0
   fi
+  die "resource group $AZ_RESOURCE_GROUP does not exist.
 
-  # A resource group costs nothing and holds nothing, but `az deployment group what-if`
-  # cannot run without one. So --dry-run alone reports the limitation, and --allow-rg
-  # opts into creating just the (free) group so the what-if is actually meaningful.
-  if [ "${DRY_RUN:-0}" = "1" ] && [ "${ALLOW_RG:-0}" != "1" ]; then
-    warn "resource group $AZ_RESOURCE_GROUP does not exist, and --dry-run will not create it"
-    detail "what-if is scoped to a resource group, so it cannot run without one."
-    detail "Re-run with --allow-rg to create the (free, empty) group and get a real what-if."
-    return 0
-  fi
-
-  az group create -n "$AZ_RESOURCE_GROUP" -l "$AZ_REGION" \
-    --tags project=stream-relay managed-by=stream-relay posture=cold-standby >/dev/null
-  # An earlier version reported "created" even on the dry-run path, which was simply
-  # untrue. Only claim it after actually doing it.
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    ok "created resource group $AZ_RESOURCE_GROUP (empty and free; --allow-rg)"
-  else
-    ok "created resource group $AZ_RESOURCE_GROUP"
-  fi
+  This deployment adopts existing resources and will not create the group. Either the
+  configured name is wrong, or the group was deleted - in which case the VM, its vault and
+  its disks went with it and this is a restore, not a deploy."
 }
+
+
+do_passphrase() { ensure_passphrase; }
+
+
+# One `az deployment group create` for the whole template: the NSG rule set and the budget.
+# ARM computes the diff, so re-running is inherently idempotent.
+do_infra() { deploy_bicep "infra"; }
+
 
 # identity, key-vault, acr, network, vm, front-door and guardrails are all created by the
 # single Bicep deployment, which is itself idempotent. Splitting them into separate steps
 # would mean reimplementing Bicep's dependency graph in bash.
-do_identity()             { deploy_bicep "identity"; }
-do_federated-credential() { skipped "created by the Bicep deployment (identity module)"; }
-do_key-vault()            { ensure_passphrase; }
-do_acr()                  { skipped "created by the Bicep deployment (acr module)"; }
 
-do_storage() {
-  require_env AZ_STORAGE_ACCOUNT
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    info "[dry-run] would enable static-website hosting on $AZ_STORAGE_ACCOUNT"
-    return 0
-  fi
-
-  # Static-website hosting is a DATA-PLANE property, not an ARM one: there is no Bicep or
-  # template equivalent, so it has to be switched on with a CLI call after the account
-  # exists. Miss this and the $web endpoint 404s everything while every resource looks
-  # perfectly healthy in the portal.
-  local enabled
-  enabled=$(az_query storage blob service-properties show \
-    --account-name "$AZ_STORAGE_ACCOUNT" --auth-mode login \
-    --query "staticWebsite.enabled" -o tsv || echo "")
-
-  if [ "$enabled" = "true" ]; then
-    skipped "static-website hosting already enabled"
-  else
-    # --auth-mode login because the account has shared-key access disabled: there is no
-    # account key to fall back on, by design.
-    az_do storage blob service-properties update \
-      --account-name "$AZ_STORAGE_ACCOUNT" --auth-mode login \
-      --static-website true \
-      --index-document index.m3u8 \
-      --404-document index.m3u8 -o none \
-      || die "could not enable static-website hosting on $AZ_STORAGE_ACCOUNT.
-    This needs 'Storage Blob Data Contributor' (or Owner) on the account for YOUR account,
-    not just the VM identity, because it is a data-plane call."
-    ok "enabled static-website hosting"
-  fi
-
-  local host
-  host=$(az_query storage account show -n "$AZ_STORAGE_ACCOUNT" \
-    --query "primaryEndpoints.web" -o tsv || echo "")
-  [ -n "$host" ] && info "delivery origin: $host"
-  state_record_output staticWebsiteEndpoint "$host"
-  return 0
-}
-do_network()              { skipped "created by the Bicep deployment (network module)"; }
-do_vm()                   { skipped "created by the Bicep deployment (vm module)"; }
-do_front-door()           { skipped "created by the Bicep deployment (frontdoor module)"; }
-do_guardrails()           { skipped "created by the Bicep deployment (guardrails module)"; }
 
 # One `az deployment group create` for the whole template. ARM computes the diff, so
 # re-running is inherently idempotent and a partially-failed deployment resumes correctly.
@@ -466,23 +408,7 @@ ensure_passphrase() {
   ok "generated and stored a 40-character passphrase (never echoed, never in argv)"
 }
 
-do_build-push-image() {
-  require_env AZ_ACR_NAME
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    info "[dry-run] would build and push stream-relay-mediamtx to $AZ_ACR_NAME"
-    return 0
-  fi
-  docker info >/dev/null 2>&1 || die "Docker daemon is not running"
-  # ACR build runs server-side, so no local docker push and no cross-architecture surprise
-  # from building on an arm64 Mac for an amd64 VM.
-  az_do acr build --registry "$AZ_ACR_NAME" \
-    --image "stream-relay-mediamtx:latest" \
-    --platform linux/amd64 \
-    "$REPO_ROOT/docker/mediamtx" >/dev/null
-  ok "image built in ACR for linux/amd64"
-}
-
-do_configure-vm() {
+do_configure() {
   require_env AZ_RESOURCE_GROUP AZ_VM_NAME
   local tmpl="$DEPT_DIR/mediamtx.yml.tmpl"
   [ -f "$tmpl" ] || die "missing $tmpl"
@@ -558,72 +484,6 @@ journalctl -u relay-hls-sync --no-pager -n 8 2>&1 | tail -8" \
   printf '%s\n' "$result" | sed 's/^/      /' >&2
   die "configure-vm failed. Common causes: Key Vault RBAC still propagating (retry the step),
     or the image tag missing from ACR (re-run --step build-push-image)."
-}
-
-do_discover-hostname() {
-  require_env AZ_RESOURCE_GROUP AZ_FRONTDOOR_PROFILE AZ_FRONTDOOR_ENDPOINT
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    info "[dry-run] would read the Front Door hostname and write it into relay.yml"
-    return 0
-  fi
-  local host
-  host=$(az_query afd endpoint show -g "$AZ_RESOURCE_GROUP" \
-    --profile-name "$AZ_FRONTDOOR_PROFILE" --endpoint-name "$AZ_FRONTDOOR_ENDPOINT" \
-    --query hostName -o tsv)
-  [ -n "$host" ] || die "could not read the Front Door hostname"
-
-  # Sanity-check the shape. A bare '<endpoint>.azurefd.net' would mean Azure changed its
-  # naming, and silently accepting it would resurrect the very bug this step exists for.
-  case "$host" in
-    "$AZ_FRONTDOOR_ENDPOINT.azurefd.net")
-      die "Front Door returned the un-hashed form '$host', which contradicts the documented
-    <endpoint>-<hash>.z01.azurefd.net format. Investigate before trusting it." ;;
-    *.azurefd.net) ok "discovered hostname: $host" ;;
-    *) die "unexpected hostname from Front Door: $host" ;;
-  esac
-
-  local config_repo="${CONFIG_REPO:-$REPO_ROOT/../stream-relay-config}"
-  if [ -f "$config_repo/tools/render-relay.py" ]; then
-    (cd "$config_repo" && python3 tools/render-relay.py "$DEPT" --set-frontdoor-hostname "$host") \
-      || warn "could not update relay.yml automatically; set azure.frontdoor_hostname to $host"
-  else
-    warn "config repo not found; set azure.frontdoor_hostname to $host by hand"
-  fi
-  state_record_output frontDoorHostName "$host"
-}
-
-do_custom-domain() {
-  if [ -z "${RELAY_CUSTOM_DOMAIN:-}" ]; then
-    skipped "no custom domain configured (Phase A) — serving on the Front Door hostname"
-    return 0
-  fi
-  require_env AZ_RESOURCE_GROUP AZ_FRONTDOOR_PROFILE
-  local domain_res="${RELAY_CUSTOM_DOMAIN//./-}"
-  local token state
-  token=$(az_query afd custom-domain show -g "$AZ_RESOURCE_GROUP" \
-    --profile-name "$AZ_FRONTDOOR_PROFILE" --custom-domain-name "$domain_res" \
-    --query validationProperties.validationToken -o tsv || echo "")
-  state=$(az_query afd custom-domain show -g "$AZ_RESOURCE_GROUP" \
-    --profile-name "$AZ_FRONTDOOR_PROFILE" --custom-domain-name "$domain_res" \
-    --query domainValidationState -o tsv || echo Unknown)
-
-  local host
-  host=$(state_get_output frontDoorHostName || echo "<run discover-hostname first>")
-  local sub="${RELAY_CUSTOM_DOMAIN%%.*}"
-  local parent="${RELAY_CUSTOM_DOMAIN#*.}"
-
-  printf "\n${BOLD}Request these DNS records for %s:${NC}\n\n" "$RELAY_CUSTOM_DOMAIN"
-  printf "  TXT    _dnsauth.%s    %s\n" "$sub" "${token:-<pending>}"
-  printf "  CNAME  %s    %s\n" "$sub" "$host"
-  printf "  CAA    %s    0 issue \"digicert.com\"   # only if CAA is enforced\n\n" "$parent"
-  info "validation state: $state"
-  if [ "$state" != "Approved" ]; then
-    warn "Front Door needs BOTH records before it issues a certificate."
-    warn "This step is resumable: re-run with --from custom-domain once DNS is live."
-    warn "Issuance then takes a further 24-48h."
-  else
-    ok "domain validated"
-  fi
 }
 
 do_verify() {

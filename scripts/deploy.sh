@@ -7,7 +7,6 @@
 #   scripts/deploy.sh --from front-door      # resume from a step onwards
 #   scripts/deploy.sh --step discover-hostname
 #   scripts/deploy.sh --no-verify           # deploy, leave verification to a separate gate
-#   scripts/deploy.sh --dry-run --allow-rg  # create only the free, empty resource group
 #                                           # so what-if has a scope to run in
 #   scripts/deploy.sh --with-role-assignments  # ONE-TIME human bootstrap: creates RBAC,
 #                                             # needs Owner/UAA. CI never uses this.
@@ -27,7 +26,6 @@ DEPT_DIR="$CONFIG_REPO/$DEPT"
 
 DRY_RUN=0
 RESUME=0
-ALLOW_RG=0
 SKIP_VERIFY=0
 DEPLOY_ROLE_ASSIGNMENTS=0
 ONLY_STEP=""
@@ -48,7 +46,9 @@ while [ $# -gt 0 ]; do
     --dry-run)     DRY_RUN=1 ;;
     --resume)      RESUME=1 ;;
     --no-verify)   SKIP_VERIFY=1 ;;
-    --allow-rg)    ALLOW_RG=1 ;;
+    # Retained as a no-op: the resource group is adopted, never created, so there is
+    # nothing for this to allow. Accepting it keeps older invocations working.
+    --allow-rg)    warn "--allow-rg is a no-op: the resource group is adopted, not created" ;;
     --with-role-assignments) DEPLOY_ROLE_ASSIGNMENTS=1 ;;
     --step)        ONLY_STEP="${2:?--step needs a step name}"; shift ;;
     --from)        FROM_STEP="${2:?--from needs a step name}"; shift ;;

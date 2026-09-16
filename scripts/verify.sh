@@ -62,11 +62,19 @@ IP="$(state_get_output ingestIpAddress || true)"
 
 # --- 1. hostname shape ------------------------------------------------------------------
 step_header 1 6 "Hostname"
-if [ "$HOST" = "${AZ_FRONTDOOR_ENDPOINT}.azurefd.net" ]; then
-  check_fail "hostname is the un-hashed form — contradicts the documented AFD naming"
-else
-  check_ok "hostname carries the expected pseudorandom hash"
-fi
+# The name must be one a public CA can certify. cloudapp.azure.com is absent from the
+# Public Suffix List, so Let's Encrypt counts it against azure.com - a rate limit shared
+# with every Azure tenant - and certbot can never issue for it. A deployment that quietly
+# fell back to the derived name would serve an expired or self-signed certificate to every
+# display.
+case "$HOST" in
+  *.cloudapp.azure.com)
+    check_fail "hostname is the Azure-derived name; no public CA will issue for it" ;;
+  "")
+    check_fail "no hostname configured" ;;
+  *)
+    check_ok "hostname is a certifiable name ($HOST)" ;;
+esac
 if [ -n "$EXPECT_HOSTNAME" ]; then
   # The teardown/redeploy stability check. This is what proves TenantReuse works.
   [ "$HOST" = "$EXPECT_HOSTNAME" ] \
@@ -205,11 +213,22 @@ if az consumption budget show --budget-name relay-budget >/dev/null 2>&1 \
 else
   check_fail "no budget found — an unbounded public endpoint with no cost alarm"
 fi
-waf="${AZ_FRONTDOOR_PROFILE//-/}waf"
-if az network front-door waf-policy show -g "$AZ_RESOURCE_GROUP" -n "$waf" >/dev/null 2>&1; then
-  check_ok "WAF rate-limit policy exists"
+# The WAF went with Front Door. The NSG is the access control now, and the rule that
+# matters is the one admitting SRT: without it the encoder cannot publish at all, and the
+# failure is silent because page-stream's backoff reconnects forever rather than exiting.
+nsg="${AZ_NSG_NAME:-${AZ_VM_NAME}-nsg}"
+if az network nsg rule show -g "$AZ_RESOURCE_GROUP" --nsg-name "$nsg" -n AllowSrtIngest \
+     >/dev/null 2>&1; then
+  check_ok "SRT ingest rule present on $nsg"
 else
-  check_fail "no WAF policy — the rate limit is not enforced"
+  check_fail "no AllowSrtIngest rule — publishers cannot reach the relay"
+fi
+# Port 22 must not be open: administration is `az vm run-command` over the control plane.
+if az network nsg rule list -g "$AZ_RESOURCE_GROUP" --nsg-name "$nsg" \
+     --query "[?destinationPortRange=='22'].name" -o tsv 2>/dev/null | grep -q .; then
+  check_fail "an NSG rule opens port 22 — there should be no inbound administrative path"
+else
+  check_ok "no inbound SSH rule"
 fi
 
 printf "\n"

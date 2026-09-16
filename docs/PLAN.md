@@ -230,8 +230,8 @@ being a standby.
 
 | Repo | Visibility | Contents |
 | :--- | :--- | :--- |
-| **`pu-orfe/stream-relay`** | **private** | The engine. `mediamtx.yml` template, transcode profiles, Dockerfiles, `infra/*.bicep`, `scripts/{bootstrap,deploy,update,teardown}.sh`, `docker-compose.local.yml`, mock + integration test suites, thorough README. Department-agnostic — no ORFE specifics, no resource names. |
-| **`pu-orfe/stream-relay-config`** | **private** | The deployment. `orfe/relay.yml` (single source of truth: channels, paths, tier, Azure resource names, domain), generated `orfe/mediamtx.yml` + `orfe/.env` + `orfe/infra.bicepparam`, `.github/workflows/{deploy,tests,rehearsal}.yml`, per-department dirs for future units. |
+| **`pu-shd/stream-relay`** | **private** | The engine. `mediamtx.yml` template, transcode profiles, Dockerfiles, `infra/*.bicep`, `scripts/{bootstrap,deploy,update,teardown}.sh`, `docker-compose.local.yml`, mock + integration test suites, thorough README. Department-agnostic — no ORFE specifics, no resource names. |
+| **`pu-shd/stream-relay-config`** | **private** | The deployment. `orfe/relay.yml` (single source of truth: channels, paths, tier, Azure resource names, domain), generated `orfe/mediamtx.yml` + `orfe/.env` + `orfe/infra.bicepparam`, `.github/workflows/{deploy,tests,rehearsal}.yml`, per-department dirs for future units. |
 
 Both private (decided). The split is therefore **structural, not a visibility boundary**: engine
 vs. deployment, mirroring `page-stream` / `page-stream-config` in shape so the idioms transfer.
@@ -319,7 +319,7 @@ steps:
 ```
 
 - **GitHub → Azure:** user-assigned managed identity + federated identity credential scoped to
-  `repo:pu-orfe/stream-relay-config:environment:production`. No client secret exists. The three
+  `repo:pu-shd/stream-relay-config:environment:production`. No client secret exists. The three
   IDs are non-sensitive and live in `vars`. Avoid wildcard/flexible FIC subjects — GA status
   unconfirmed; enumerate branch + environment subjects explicitly.
 - **VM → ACR:** the VM's UAMI plus `Container Registry Repository Reader` (the current
