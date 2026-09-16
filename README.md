@@ -4,38 +4,39 @@ SRT ingest, HLS delivery. An encoder publishes SRT to this service; viewers play
 HTTPS. It exists so a department can run more concurrent streams than its upstream video
 platform allows.
 
-Deployed for ORFE it carries eight channels of digital signage to Apple TVs in Sherrerd
-Hall, publishing from an on-prem Mac running [`page-stream`](https://github.com/pu-orfe/page-stream).
+It is department-agnostic: this repo holds no resource names, addresses or channel
+definitions. A deployment lives in its own config repo, which supplies all of those.
 
 ---
 
 ## Architecture
 
 ```
-on-prem encoder                    Azure VM (canadacentral)
+  encoder                          Azure VM
 ┌──────────────┐                   ┌────────────────────────────────────┐
-│ page-stream  │ ──SRT/UDP:8890──► │ MediaMTX      remux, no transcode  │
-│ 8 producers  │   encrypted       │   └─ writes HLS to /srv/hls        │
+│  publisher   │ ──SRT/UDP:8890──► │ MediaMTX      remux, no transcode  │
+│  (1 or many) │   encrypted       │   └─ writes HLS to disk            │
 └──────────────┘                   │ nginx :443    serves those files   │
                                    │ nginx :80     ACME challenge only  │
                                    │ certbot       renews on a loop     │
                                    └────────────────┬───────────────────┘
                                                     │ HTTPS
-                                          Apple TVs, campus network
+                                                 viewers
 ```
 
-No CDN and no object store. Ten viewers on the same campus network as the origin give a CDN
-nothing to optimise, so nginx serves MediaMTX's `hlsDirectory` directly and the network
-security group is the access control.
+No CDN and no object store. For an audience close to the origin there is nothing for a CDN
+to optimise, so nginx serves MediaMTX's `hlsDirectory` directly and the network security
+group is the access control. At CDN-scale viewership that trade stops making sense.
 
 MediaMTX's own HLS port is bound but never published. It gates variant playlists on a
 per-viewer session and sends `Cache-Control: private, no-cache`; nginx serving the files
 from disk has neither behaviour.
 
-**The VM is adopted, not created.** It already existed with its own vnet, NIC, static public
-IP, Key Vault, disks and alert rules. Bicep references those as `existing`, because
-declaring an existing VM invites Azure to replace it — and replacement destroys its disks.
-The resource group is shared with unrelated services.
+**The template adopts a VM rather than creating one.** It references the host, its network
+and its vault as `existing`, so the relay can be added to a machine that already does other
+work. Declaring an existing VM instead would let Azure decide to replace it, and replacement
+destroys its disks. The resource group may be shared, which is why nothing here deletes by
+group.
 
 ---
 
@@ -110,7 +111,7 @@ Administrator. Every other run, CI included, never touches RBAC.
 | `deploy.sh` | non-interactive, idempotent, CI-callable |
 | `verify.sh` | asserts the deployed relay actually serves |
 | `update.sh` | roll new config without touching infrastructure |
-| `restrict.sh` | kill switch — narrow the allowlist to campus, or to nothing |
+| `restrict.sh` | kill switch — narrow the viewer allowlist, or close it entirely |
 | `allow-all.sh` | break glass — reopen after `restrict.sh` |
 | `teardown.sh` | remove the relay's own resources (see below) |
 
@@ -123,7 +124,7 @@ The NSG is the boundary. There is no WAF and no CDN in front of it.
 | Port | Source |
 | :--- | :--- |
 | `8890/udp` | the publisher's network — SRT wire encryption is the publish credential |
-| `443/tcp` | campus ranges plus GlobalProtect VPN egress |
+| `443/tcp` | the viewer networks the config allows — nothing else reaches the HLS |
 | `80/tcp` | the internet, serving `/.well-known/acme-challenge` and nothing else |
 | `22` | **no rule** |
 
@@ -134,10 +135,10 @@ exposed is a directory of ACME tokens.
 There is no inbound administrative path. Administration is `az vm run-command` over the
 Azure control plane, which is RBAC-gated and audited.
 
-**VPN ranges are vendor prefixes, not resolved gateway addresses.** Prisma Access
-source-NATs clients from an egress pool that is not adjacent to the gateway's ingress, so an
-allowlist built from resolved gateways admits the gateways and blocks every client behind
-them.
+**Allowlisting a VPN needs the egress ranges, not the gateway addresses.** Cloud VPN
+services commonly source-NAT clients from a pool that is not adjacent to the gateway a
+client connected to, so a list built from resolved gateway addresses admits the gateways and
+blocks every client behind them. Test from a real VPN connection before trusting one.
 
 ---
 
@@ -182,17 +183,13 @@ Egress dominates, and it scales with **viewers**, not channels:
 monthly egress GB ≈ viewers × bitrate_Mbps × 3600 × 24 × 30 / 8 / 1000
 ```
 
-At eight channels, ten viewers, 1000k:
+Egress is typically the larger line by several times. Run `tools/render-relay.py <dept>
+--size` in the config repo for a projection from the actual channel count, bitrate and
+expected viewers.
 
-| | |
-| :--- | :--- |
-| VM (`Standard_D2s_v6`) | $72.72 |
-| egress (3,240 GB) | $281.88 |
-| **total** | **~$355/mo** |
-
-Run `tools/render-relay.py <dept> --size` in the config repo for the current projection.
-Bitrate is the highest-leverage lever; VM size is not, because remuxing is an I/O job.
-Measured: eight channels publishing simultaneously drew 13.4% of one core.
+Bitrate is the highest-leverage lever. VM size is not: remuxing is an I/O job, and a
+two-vCPU host carries eight simultaneous 1080p channels at around 13% of one core, so the
+sizing model errs generous by design.
 
 A budget with forecast alerts is provisioned by the deployment. Forecast matters — once
 actual spend crosses a ceiling the money is already gone.
@@ -220,7 +217,8 @@ scripts/teardown.sh --keep-ip --keep-registry
 
 Removes the SRT ingest rule, the budget, the CI identity and the relay container. Leaves the
 VM, its NIC, vnet, NSG, public IP, Key Vault and disks, all of which are adopted — and
-leaves the `:443` and `:80` rules, because other services on the host depend on them.
+leaves the `:443` and `:80` rules, since other services on a shared host may serve on one
+and renew certificates over the other.
 
 Deleting the resource group is refused when `SHARED_RESOURCE_GROUP` is not exactly `false`,
 and fails closed when the flag is absent.
