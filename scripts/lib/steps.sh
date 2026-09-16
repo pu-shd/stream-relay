@@ -100,9 +100,12 @@ do_preflight() {
   # needs Owner or User Access Administrator. Everything afterwards (including every CI
   # deploy) runs with 0 and needs only Contributor - deliberately, because a principal that
   # can create role assignments can grant itself any role in the scope.
-  local roles
-  roles=$(az_query role assignment list --assignee "$user" --include-inherited \
-    --query "[].roleDefinitionName" -o tsv || true)
+  # Scoped to the resource group, because that is where the roles are granted; an
+  # unscoped list also misses nothing but costs a subscription-wide enumeration.
+  local roles rg_scope
+  rg_scope="/subscriptions/$sub_id/resourceGroups/${AZ_RESOURCE_GROUP:?}"
+  roles=$(az_query role assignment list --assignee "$user" --scope "$rg_scope" \
+    --include-inherited --query "[].roleDefinitionName" -o tsv || true)
 
   if [ "${DEPLOY_ROLE_ASSIGNMENTS:-0}" = "1" ]; then
     if grep -qE '^(Owner|User Access Administrator)$' <<<"$roles"; then
@@ -113,11 +116,27 @@ do_preflight() {
     Contributor cannot create the RBAC this template establishes."
     fi
   else
-    if grep -qE '^(Owner|Contributor|User Access Administrator)$' <<<"$roles"; then
+    # NOT Contributor. The resource group is shared - it holds orfe-web-vm, its Key Vault,
+    # vnet, disks and alerts - so Contributor there would permit deleting the machine the
+    # relay runs on. The narrow pair is exactly what main.bicep deploys: Network
+    # Contributor for the NSG (and Microsoft.Resources/deployments/*), Cost Management
+    # Contributor for the budget.
+    if grep -qE '^(Owner|Contributor)$' <<<"$roles"; then
       ok "role permits deploying (no RBAC changes in this run)"
+    elif grep -qx 'Network Contributor' <<<"$roles" \
+      && grep -qx 'Cost Management Contributor' <<<"$roles"; then
+      ok "role permits deploying (narrow grant: Network + Cost Management Contributor)"
+    elif [ -z "${roles//[[:space:]]/}" ]; then
+      # Inconclusive, not negative. Listing role assignments needs
+      # Microsoft.Authorization/*/read, and a principal can be perfectly able to deploy
+      # while unable to enumerate its own grants. Dying here would block a deploy on a
+      # check that proved nothing; the deployment itself fails clearly if it truly cannot.
+      warn "could not enumerate role assignments for this principal at $rg_scope"
+      detail "continuing: the deployment will fail plainly if the role is genuinely absent"
     else
       fail "you have: $(tr '\n' ',' <<<"$roles")"
-      die "Contributor (or higher) on the resource group is required."
+      die "this principal cannot deploy. Grant either Contributor, or the narrow pair
+    Network Contributor + Cost Management Contributor, on $AZ_RESOURCE_GROUP."
     fi
 
     # Fail CLOSED if the RBAC this deployment depends on was never established. Otherwise
