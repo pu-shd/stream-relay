@@ -271,6 +271,20 @@ do_infra() { deploy_bicep "infra"; }
 # re-running is inherently idempotent and a partially-failed deployment resumes correctly.
 deploy_bicep() {
   require_env AZ_RESOURCE_GROUP
+  # NOTE: --template-file is deliberately NOT passed.
+  #
+  # A .bicepparam names its own template in a `using` declaration, and the CLI resolves it
+  # relative to the parameter file. Passing --template-file as well makes the CLI compare
+  # the two paths TEXTUALLY and refuse when they differ - which they do the moment the same
+  # file is reachable two ways, as in CI where the engine is checked out at ./engine and
+  # symlinked to the sibling path the parameter file expects:
+  #
+  #   Bicep file .../engine/infra/main.bicep provided with --bicep-file option doesn't
+  #   match the Bicep file .../stream-relay/infra/main.bicep referenced by the "using"
+  #   declaration in the parameters file.
+  #
+  # Same file, same content, two spellings. Letting `using` be the single source avoids the
+  # class entirely.
   local param_file="$DEPT_DIR/infra.bicepparam"
   [ -f "$param_file" ] || die "missing $param_file — run render-relay.py in the config repo"
 
@@ -326,7 +340,6 @@ deploy_bicep() {
   local args=(deployment group create
     --resource-group "$AZ_RESOURCE_GROUP"
     --name "stream-relay-$(date -u +%Y%m%d%H%M%S)"
-    --template-file "$REPO_ROOT/infra/main.bicep"
     --parameters "$param_file"
     "${rbac_param[@]+"${rbac_param[@]}"}")
   [ -n "$operator_oid" ] && args+=(--parameters "operatorObjectId=$operator_oid")
@@ -342,7 +355,6 @@ deploy_bicep() {
     info "running what-if instead of deploying (--dry-run)"
     if ! az deployment group what-if \
       --resource-group "$AZ_RESOURCE_GROUP" \
-      --template-file "$REPO_ROOT/infra/main.bicep" \
       --parameters "$param_file" \
       "${rbac_param[@]+"${rbac_param[@]}"}" \
       ${operator_oid:+--parameters "operatorObjectId=$operator_oid"} \
@@ -355,7 +367,6 @@ deploy_bicep() {
         warn "azure-cli could not render the error (known CLI bug) — retrying with validate"
         az deployment group validate \
           --resource-group "$AZ_RESOURCE_GROUP" \
-          --template-file "$REPO_ROOT/infra/main.bicep" \
           --parameters "$param_file" \
           ${operator_oid:+--parameters "operatorObjectId=$operator_oid"} \
           -o json > "$REPO_ROOT/.validate.json" 2>&1 || true
