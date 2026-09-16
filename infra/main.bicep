@@ -89,6 +89,9 @@ param pugwipsEnabled bool = false
 @description('Static campus ranges permitted to read HLS.')
 param campusRanges array = []
 
+@description('GlobalProtect VPN egress ranges permitted to read HLS. Kept separate from campusRanges because these are a dated snapshot of addresses that rotate, while campus ranges are institutional and stable.')
+param gatewayRanges array = []
+
 @description('MediaMTX paths, one per channel. Used to emit the viewer URLs.')
 param relayPaths array
 
@@ -165,7 +168,12 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
             direction: 'Inbound'
             access: 'Allow'
             protocol: 'Tcp'
-            sourceAddressPrefixes: pugwipsEnabled ? campusRanges : []
+            // Campus plus the VPN egress pools. The pools are the vendor's registered
+            // blocks rather than the resolved gateway addresses, because Prisma Access
+            // source-NATs clients from an egress pool that is not adjacent to the gateway
+            // ingress - allowlisting the resolved /24s admits the gateway and blocks every
+            // actual viewer.
+            sourceAddressPrefixes: pugwipsEnabled ? concat(campusRanges, gatewayRanges) : []
             sourceAddressPrefix: pugwipsEnabled ? null : 'Internet'
             sourcePortRange: '*'
             destinationAddressPrefix: '*'
