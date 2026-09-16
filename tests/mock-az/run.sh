@@ -41,33 +41,39 @@ setup_config() {
     cp "$real" "$dir/deploy.env"
   else
     cat > "$dir/deploy.env" <<'EOF'
-AZ_REGION=eastus
-AZ_RESOURCE_GROUP=orfe-dept-azure-relay-rg
-AZ_ACR_NAME=acrorfestreamrelay
-AZ_STORAGE_ACCOUNT=storfeorferelayhls
-AZ_KEY_VAULT=kv-orfe-relay
-AZ_IDENTITY_CI=id-orfe-relay-ci
-AZ_IDENTITY_VM=id-orfe-relay-vm
-AZ_VM_NAME=vm-orfe-relay
-AZ_VM_SIZE=Standard_D4s_v6
-AZ_VM_VCPU=4
-AZ_FRONTDOOR_PROFILE=afd-orfe-relay
-AZ_FRONTDOOR_ENDPOINT=orfe-relay
-AZ_NSG_NAME=relay-nsg
-RELAY_HOST=UNRESOLVED-run-deploy.sh-to-discover
-RELAY_CUSTOM_DOMAIN=
+# FIXTURE ONLY - deliberately not real values.
+#
+# Used when the config repo is not checked out beside this one. Addresses are RFC 5737
+# documentation ranges and names are generic: a fixture that carries production values
+# invites someone to read it as truth, and this repo is public.
+AZ_REGION=canadacentral
+AZ_RESOURCE_GROUP=example-relay-rg
+SHARED_RESOURCE_GROUP=false
+RELAY_OWNS_KEY_VAULT=true
+AZ_ACR_NAME=acrexamplerelay
+AZ_KEY_VAULT=kv-example-relay
+AZ_IDENTITY_CI=id-example-relay-ci
+AZ_IDENTITY_VM=id-example-relay-vm
+AZ_VM_NAME=vm-example-relay
+AZ_VM_SIZE=Standard_D2s_v6
+AZ_VM_VCPU=2
+AZ_DNS_LABEL=example-relay
+HOSTS=relay-1
+DEFAULT_HOST=relay-1
+AZ_NSG_NAME=vm-example-relay-nsg
+RELAY_HOST=relay.example.edu
+RELAY_CUSTOM_DOMAIN=relay.example.edu
 SRT_PORT=8890
 PBKEYLEN=32
 SRT_PASSPHRASE_SECRET=srt-publish-passphrase
-CHANNEL_COUNT=7
+CHANNEL_COUNT=8
 CAPACITY_TIER=0
-WAF_RATE_LIMIT_RPM=600
-BUDGET_WARN_USD=400
-BUDGET_ALERT_USD=800
+BUDGET_WARN_USD=600
+BUDGET_ALERT_USD=900
 PUGWIPS_ENABLED=0
 PUGWIPS_REPO=PrincetonUniversity/pugwips
 PUGWIPS_STATIC_RANGES=203.0.113.0/24,198.51.100.0/24
-RELAY_PATHS=news,news-plus,undergraduate,graduate,announcements,scenic,live-events
+RELAY_PATHS=news,news-plus,undergraduate,graduate,announcements,scenic,inspiration,live-events
 EOF
   fi
   printf 'srtPublishPassphrase: ${SRT_PUBLISH_PASSPHRASE}\n' > "$dir/mediamtx.yml.tmpl"

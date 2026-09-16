@@ -10,7 +10,7 @@ the `*.azurefd.net` hostname that is torn down the same day.
 
 ## 1. Preflight: what the live subscription actually says
 
-Checked against `ORFE-dept-azure` (`REDACTED-…`, Princeton tenant) on 2026-07-29:
+Checked against the department subscription (id redacted) on 2026-07-29:
 
 | Check | Result | Consequence |
 | :--- | :--- | :--- |
@@ -146,7 +146,7 @@ there is exactly one code path to test.
 // .stream-relay-state.json (gitignored)
 {
   "schema": 1,
-  "subscription": "REDACTED-…",
+  "subscription": "<subscription-id>",
   "resource_group": "orfe-dept-azure-relay-rg",
   "steps": {
     "resource-group": { "status": "done", "at": "…", "ids": { "rg": "/subscriptions/…" } },
