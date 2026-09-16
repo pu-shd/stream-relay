@@ -31,8 +31,10 @@ services:
     ports:
       - "8890:8890/udp"   # SRT ingest
       - "8888:8888"       # HLS egress
-      # API (9997) and metrics (9998) bind to loopback inside the container by design
-      # and are deliberately not published.
+      # API (9997) and metrics (9998) are bound inside the container and deliberately not
+      # published. Note they bind :PORT, not 127.0.0.1: inside a container that would be
+      # the container's own loopback, which Docker cannot forward a published port to -
+      # the port would simply refuse. Exposure is decided by publishing, not by binding.
     restart: unless-stopped
 
   # Optional test pattern, so the stack is verifiable without page-stream running.

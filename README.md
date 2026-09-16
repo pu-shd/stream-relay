@@ -1,541 +1,245 @@
 # stream-relay
 
-A MediaMTX-based SRT ingest, optional transcode, and CDN egress service — built as a **cold
-standby** for [`page-stream`](https://github.com/pu-orfe/page-stream) should an institutional
-Kaltura license lapse.
+SRT ingest, HLS delivery. An encoder publishes SRT to this service; viewers play HLS over
+HTTPS. It exists so a department can run more concurrent streams than its upstream video
+platform allows.
 
-`page-stream` captures web pages and pushes SRT to an ingest. Today that ingest is Kaltura,
-which also transcodes, packages HLS, and fronts a CDN. `stream-relay` replaces that
-distribution plane on Azure with MediaMTX + ffmpeg + Azure Front Door, **without changing a
-single line of `page-stream`**.
-
-> **This is a fallback, not production.** It is designed to be deployed from nothing in under
-> 30 minutes and torn down to ~$9/month. If you found it running and nobody is mid-cutover,
-> something is wrong — see [Cost posture](#cost-posture).
+Deployed for ORFE it carries eight channels of digital signage to Apple TVs in Sherrerd
+Hall, publishing from an on-prem Mac running [`page-stream`](https://github.com/pu-orfe/page-stream).
 
 ---
 
-## Status
+## Architecture
 
-**PROVEN END TO END against live Azure, then torn down.** Encrypted SRT from the open
-internet → MediaMTX → Blob static website → Front Door → ffprobe-decodable 1920×1080
-h264+aac, with segments served from the edge cache.
+```
+on-prem encoder                    Azure VM (canadacentral)
+┌──────────────┐                   ┌────────────────────────────────────┐
+│ page-stream  │ ──SRT/UDP:8890──► │ MediaMTX      remux, no transcode  │
+│ 8 producers  │   encrypted       │   └─ writes HLS to /srv/hls        │
+└──────────────┘                   │ nginx :443    serves those files   │
+                                   │ nginx :80     ACME challenge only  │
+                                   │ certbot       renews on a loop     │
+                                   └────────────────┬───────────────────┘
+                                                    │ HTTPS
+                                          Apple TVs, campus network
+```
 
-| Component | State |
+No CDN and no object store. Ten viewers on the same campus network as the origin give a CDN
+nothing to optimise, so nginx serves MediaMTX's `hlsDirectory` directly and the network
+security group is the access control.
+
+MediaMTX's own HLS port is bound but never published. It gates variant playlists on a
+per-viewer session and sends `Cache-Control: private, no-cache`; nginx serving the files
+from disk has neither behaviour.
+
+**The VM is adopted, not created.** It already existed with its own vnet, NIC, static public
+IP, Key Vault, disks and alert rules. Bicep references those as `existing`, because
+declaring an existing VM invites Azure to replace it — and replacement destroys its disks.
+The resource group is shared with unrelated services.
+
+---
+
+## Repository split
+
+| | |
 | :--- | :--- |
-| Config renderer + schema | ✅ 158 tests |
-| MediaMTX image + fail-closed entrypoint | ✅ verified |
-| Bicep (9 modules) | ✅ deployed for real, repeatedly |
-| Scripts (7) + offline `az` suite | ✅ 32 assertions |
-| Two-identity least-privilege RBAC | ✅ verified live |
-| Managed-identity chain (ACR pull, Key Vault read, Blob write) | ✅ verified live — no stored credential |
-| Encrypted SRT ingest from the internet | ✅ verified live |
-| **HLS delivery through Front Door** | ✅ **verified live** |
-| **Segment edge caching** (`x-cache: TCP_HIT`) | ✅ **verified live** |
-| Hostname stability across full teardown/redeploy | ✅ verified — same hash returned |
-| Complete teardown incl. Key Vault purge | ✅ verified — 0 resources, 0 soft-deleted vaults |
-| GitOps workflows + OIDC | ✅ authored; OIDC probe + `production` environment ready |
-| pugwips allowlist / custom domain | ❌ Phase 4 |
-| `page-stream-config --profile relay` cutover | ❌ Phase 5 |
+| **`pu-shd/stream-relay`** (this repo, public) | The engine. Bicep, deploy/verify/teardown scripts, local compose stack, test suites. Department-agnostic: no resource names, no addresses. |
+| **`pu-shd/stream-relay-config`** (private) | The deployment. `<dept>/relay.yml` is the only file anyone edits; everything else in that directory is generated from it. |
 
-Currently **$0/month** — nothing deployed. The whole verification exercise cost about $2.
-
-### The evidence
-
-```
-ffprobe via Front Door      h264, 1920x1080  +  aac
-segment request 1           x-cache: TCP_MISS   cache-control: public, max-age=60
-segment request 2           x-cache: TCP_HIT    (349,868 bytes from the edge)
-?session=aaaa vs bbbb       one cache key
-origin 8888                 not reachable from the internet
-```
-
-Segments are ~99% of the bytes and cache for 60s, so origin egress collapses to roughly one
-fill per POP rather than one per viewer — which is what makes the ~$603/mo activated estimate
-hold. Manifests miss by design (rewritten every 4s, ~2s TTL) and that is expected: `verify.sh`
-asserts caching on **segments**, because asserting it on manifests would fail forever while
-saying nothing about cost.
-
-### Why the ingest tier is a VM
-
-SRT is UDP. App Service and Container Apps are HTTP/TCP-only and cannot accept it. Container
-Instances can expose UDP and would remove OS management, at higher 24/7 cost and with less
-control over restart/health. **Delivery** needs no VM at all — that is exactly what the Blob
-topology exploits.
-
-## Contents
-
-- [Why MediaMTX (and not YouTube)](#why-mediamtx-and-not-youtube)
-- [Why Azure](#why-azure)
-- [Cost posture](#cost-posture)
-- [Architecture](#architecture)
-- [Capacity tiers](#capacity-tiers)
-- [Repository split](#repository-split)
-- [Quick start](#quick-start)
-- [Scripts](#scripts)
-- [Custom domain](#custom-domain-two-phase)
-- [Security model](#security-model)
-- [Cost guardrails](#cost-guardrails)
-- [Optional: pugwips allowlist](#optional-pugwips-allowlist)
-- [Testing](#testing)
-- [Cutover runbook](#cutover-runbook)
-- [Rehearsal drill](#rehearsal-drill)
-- [Porting to GCP](#porting-to-gcp)
-- [Troubleshooting](#troubleshooting)
+`relay.yml` renders `mediamtx.yml.tmpl`, `docker-compose.yml`, `nginx.conf`, `deploy.env`,
+`ingest-urls.env` and `infra.bicepparam`. A test asserts the generated files match the
+source, so drift fails CI rather than surfacing mid-deploy.
 
 ---
 
-## Why MediaMTX (and not YouTube)
-
-YouTube Live was evaluated first, because it costs nothing. It is not a drop-in:
-
-| | Kaltura (today) | YouTube Live | **MediaMTX** |
-| :--- | :--- | :--- | :--- |
-| SRT ingest | ✅ | ❌ RTMP/RTMPS/HLS/DASH only | ✅ native |
-| `page-stream` changes | — | `--format flv` + RTMPS URLs in every service block | **none** |
-| Audio required | no | **yes** (silent AAC track needed) | no |
-| Streams per endpoint | many, by `streamid` | one broadcast per stream key | many, by path |
-| Latency control | `latency=` tunable | 20–60 s normal | `latency=` tunable |
-| Retry semantics | exit-10 backoff | preserved (`rtmps://` matches) | preserved |
-
-MediaMTX keeps `srt://…?streamid=…` with `-f mpegts`, so `isRetryProtocol()`, the exit-code
-contract (`0` graceful / `10` retry exhausted / `11` non-retry), and the `latency=` buffer all
-carry over untouched.
-
-**Bonus:** no `#` appears anywhere in a relay ingest URL. The entire `.env.secrets.sh` workaround
-that Kaltura's `streamid=#:::e=…` forces on `page-stream-config` is unnecessary in relay mode.
-
-### The publish credential is SRT wire encryption
-
-This is the single easiest thing to get wrong, so it is stated plainly. MediaMTX has **two
-unrelated** mechanisms:
-
-| Mechanism | Config | Client |
-| :--- | :--- | :--- |
-| **SRT wire encryption** ← *what we use* | `srtPublishPassphrase` on the path | `?passphrase=<secret>&pbkeylen=32` |
-| MediaMTX internal auth | `authInternalUsers` | `streamid=publish:<path>:<user>:<pass>` |
-
-So the working ingest URL is:
-
-```
-srt://<host>:8890?streamid=publish:news&passphrase=<secret>&pbkeylen=32&latency=200000
-```
-
-Putting the secret in the streamid's fourth field **fails the handshake** with
-`connection is encrypted, but no passphrase is defined in configuration`. Encryption is the
-right choice here regardless: `page-stream` publishes to a public IP across the open internet,
-so the stream should be encrypted on the wire, and the passphrase doubles as the shared secret.
-
-Passphrases must be **10–79 characters** (an SRT requirement) and are constrained to
-`[A-Za-z0-9_-]` by the container entrypoint, which fails closed rather than risk corrupting a
-credential during substitution. Generate one with:
+## Quick start — local, no cloud, no spend
 
 ```bash
-openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 40
+export SRT_PUBLISH_PASSPHRASE=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 40)
+docker-compose -f docker-compose.local.yml --profile testsrc up -d
+open http://127.0.0.1:8888/news/index.m3u8
 ```
 
-### What MediaMTX does *not* do
+Publish from page-stream instead of the built-in test pattern:
 
-**It does not transcode.** It is a media router — it remuxes and repackages. Transcoding is an
-external `ffmpeg` process launched per stream via the `runOnAvailable` hook. Consequently:
+```bash
+node dist/index.js --url https://example.edu/page \
+  --ingest "srt://127.0.0.1:8890?streamid=publish:news&passphrase=$SRT_PUBLISH_PASSPHRASE&pbkeylen=32"
+```
 
-- **Tiers >0 are not an adaptive bitrate ladder.** MediaMTX serves one HLS playlist per path, so
-  a transcode hook publishes *additional* paths (`news-720`) at their own URLs. True ABR needs
-  an external packager writing a master playlist, replacing MediaMTX's HLS muxer.
-- There is no ABR fallback for a viewer on a bad connection — they buffer. Acceptable here
-  because every consumer is an Apple TV on campus wired ethernet.
+---
 
-> **Version note:** `runOnReady` was renamed **`runOnAvailable`** in MediaMTX v1.19.3
-> (2026-07-23). The old name still works as a deprecated alias; generated configs use the
-> current one. The image is pinned to `bluenviron/mediamtx:1.19.3-ffmpeg` — the `-ffmpeg`
-> variant is required for the transcode hooks.
+## Deploy
 
-## Why Azure
+GitOps, from the config repo: **Deploy (GitOps)** is `workflow_dispatch` only. `plan` runs
+read-only on a hosted runner and prints the what-if diff *before* the reviewer gate, so the
+approval is informed. Azure jobs authenticate with OIDC; VM-side convergence runs on a
+self-hosted runner on the VM itself.
 
-1. **The architecture is identical on both clouds, so reuse decides.** SRT is UDP; neither Azure
-   Front Door nor GCP Media CDN carries UDP. On both, ingest hits a public IP directly and only
-   HLS egress goes through the CDN.
-2. **GCP's one differentiator is priced out of range.** GCP has a managed encoder (Live Stream
-   API, which does accept SRT); Azure has none since Azure Media Services retired 2024-06-30.
-   But a 1080p ladder there is ≈$1.26/hr/channel ≈ **$920/mo per channel** — versus ~$145/mo for
-   one VM running all seven.
-3. **The secretless chains already exist on Azure.** GitHub → Azure via OIDC federated
-   credential; VM → ACR via user-assigned managed identity. Both zero-secret, both already used
-   by `pu-orfe/azure-gh-token-func` and `pugwips`.
-4. **A fallback you never rehearse must run on infrastructure you touch weekly.** Novelty is a
-   failure mode for cold standby.
+Or run it directly:
 
-## Cost posture
+```bash
+scripts/deploy.sh --dry-run          # what-if only
+scripts/deploy.sh                    # converge
+scripts/deploy.sh --from infra       # resume after a failure
+scripts/deploy.sh --list-steps
+```
 
-**Egress dominates by an order of magnitude over compute.** Viewers drive egress; channel count
-drives CPU. The two scale independently — 10 Apple TVs pull 10 concurrent streams whether you
-publish 7 channels or 20.
+Seven steps, resumable, idempotent:
+
+| Step | |
+| :--- | :--- |
+| `preflight` | tooling, login, role, quota |
+| `register-providers` | resource providers |
+| `resource-group` | confirms it exists — never creates it, the group is shared |
+| `passphrase` | ensures the SRT passphrase is in Key Vault |
+| `infra` | one Bicep deployment: NSG rules and the budget |
+| `configure` | renders the relay config on the VM and brings the stack up |
+| `verify` | asserts the deployment end to end |
+
+`--with-role-assignments` is the one-time human bootstrap; it needs Owner or User Access
+Administrator. Every other run, CI included, never touches RBAC.
+
+---
+
+## Scripts
+
+| | |
+| :--- | :--- |
+| `bootstrap.sh` | interactive first run, including the role assignments CI may not create |
+| `deploy.sh` | non-interactive, idempotent, CI-callable |
+| `verify.sh` | asserts the deployed relay actually serves |
+| `update.sh` | roll new config without touching infrastructure |
+| `restrict.sh` | kill switch — narrow the allowlist to campus, or to nothing |
+| `allow-all.sh` | break glass — reopen after `restrict.sh` |
+| `teardown.sh` | remove the relay's own resources (see below) |
+
+---
+
+## Access control
+
+The NSG is the boundary. There is no WAF and no CDN in front of it.
+
+| Port | Source |
+| :--- | :--- |
+| `8890/udp` | the publisher's network — SRT wire encryption is the publish credential |
+| `443/tcp` | campus ranges plus GlobalProtect VPN egress |
+| `80/tcp` | the internet, serving `/.well-known/acme-challenge` and nothing else |
+| `22` | **no rule** |
+
+Port 80 is open because Let's Encrypt validates from undisclosed, rotating addresses, so the
+rule cannot be narrowed to them. nginx 404s every other path on that port, so what is
+exposed is a directory of ACME tokens.
+
+There is no inbound administrative path. Administration is `az vm run-command` over the
+Azure control plane, which is RBAC-gated and audited.
+
+**VPN ranges are vendor prefixes, not resolved gateway addresses.** Prisma Access
+source-NATs clients from an egress pool that is not adjacent to the gateway's ingress, so an
+allowlist built from resolved gateways admits the gateways and blocks every client behind
+them.
+
+---
+
+## Identities
+
+Two, least privilege each.
+
+| | |
+| :--- | :--- |
+| **CI** — federated to GitHub Actions via OIDC | Network Contributor and Cost Management Contributor on the resource group, Key Vault Secrets Officer on the vault. No stored credential. |
+| **VM** — SystemAssigned | reads one Key Vault secret. Nothing else. |
+
+Not Contributor: the resource group is shared, so Contributor would permit deleting the
+machine the relay runs on.
+
+CI cannot create role assignments. `deployRoleAssignments` defaults to `false`, and a
+principal that can grant roles can grant itself any role in scope.
+
+OIDC subjects carry GitHub's immutable org and repo IDs
+(`repo:org@123/repo@456:ref:refs/heads/main`), which is what stops a renamed or transferred
+repository inheriting the trust.
+
+---
+
+## TLS
+
+certbot renews on a loop and nginx reloads on another, both as containers. A one-shot
+`certbot certonly` issues a certificate that expires ninety days later with nobody watching.
+
+The certificate must cover a real hostname. `*.cloudapp.azure.com` is absent from the Public
+Suffix List, so Let's Encrypt counts it against `azure.com` — a rate limit shared with every
+Azure tenant — and can never issue for the derived name. Enabling TLS without a `domain` is
+a config error.
+
+---
+
+## Cost
+
+Egress dominates, and it scales with **viewers**, not channels:
 
 ```
 monthly egress GB ≈ viewers × bitrate_Mbps × 3600 × 24 × 30 / 8 / 1000
 ```
 
-| Posture | What's running | Cost/mo |
-| :--- | :--- | :--- |
-| **Cold standby** (default) | ACR Basic holding built images; IaC in git | **~$5** |
-| Warm standby | + VM up, no streams | ~$150 |
-| Activated: 7 ch, tier 0, 10 viewers @1500k | VM + AFD + egress | **~$603** |
+At eight channels, ten viewers, 1000k:
 
-Run `tools/render-relay.py orfe --size` in the config repo for the current projection.
-
-Serving straight off the VM does **not** save money — Azure VM egress bills at the same
-~$0.087/GB. Front Door earns its place on free managed TLS, custom domain, and DDoS protection.
-
-**Bitrate is the highest-leverage lever.** The relay defaults to `1500k` rather than Kaltura's
-`2500k`: for mostly-static web pages the difference is invisible and saves ~$280/mo at 10
-viewers.
-
-## Architecture
-
-```
- page-stream stack (on-prem Mac)                              Azure
-┌──────────────────────────────────────┐   SRT/UDP   ┌─────────────────────────────────┐
-│ standard-1..6, compositor            │────────────▶│ Public IP  :8890/udp            │
-│   ffmpeg -f mpegts srt://…            │  encrypted  │   NSG: allowlisted sources      │
-│   streamid=publish:<path>             │             │ ┌─────────────────────────────┐ │
-│   &passphrase=…&pbkeylen=32           │             │ │                             │ │
-└──────────────────────────────────────┘             │ │ VM  (D4s v6 at tier 0)      │ │
-                                                     │ │  mediamtx — remux only      │ │
- ORFE Apple TVs (VLC)                                │ │   runOnAvailable →          │ │
-┌──────────────────────────────────────┐             │ │     ffmpeg (tiers >0 only)  │ │
-│ https://<host>/<path>/index.m3u8     │◀────────────│ │  :8888 LL-HLS               │ │
-└──────────────────────────────────────┘    HTTPS    │ └─────────────────────────────┘ │
-                                                     │ Front Door Std — TLS + cache    │
-                                                     │ Key Vault — SRT passphrase      │
-                                                     │ ACR — images, MI pull           │
-                                                     └─────────────────────────────────┘
-```
-
-Why SRT bypasses Front Door: Front Door is a Layer-7 HTTP/HTTPS/HTTP‑2 proxy with no UDP
-support. UDP ingest therefore terminates on the VM's public IP (or an Azure Standard Load
-Balancer, which does support UDP rules), and the NSG is the access control.
-
-### HLS variant, and the cache-key trap that costs real money
-
-`capacity.hls_variant` defaults to **`mpegts`**, deliberately *not* MediaMTX's own `lowLatency`
-default. Latency is irrelevant to a signage display, while `mpegts` gives the widest VLC/Apple TV
-compatibility (`EXT-X-VERSION:3`, one muxed playlist) and the fewest CDN requests.
-
-**MediaMTX appends a per-viewer `?session=<uuid>` to every variant-playlist URL, in every
-variant** — verified on `mpegts`, `fmp4` *and* `lowLatency`. Unless Front Door's cache key is
-configured to **ignore the `session` query parameter**, every viewer is a distinct cache key, the
-hit rate collapses to ~0, and you pay origin egress on top of edge egress — roughly doubling the
-bill. Front Door Standard supports *Ignore Specified Query Strings*, which is exactly the needed
-control. The rule lives in `infra/main.bicep` and is load-bearing.
-
-## Capacity tiers
-
-`capacity.tier` in `relay.yml`, overridable per channel. Sizes come from
-`tools/render-relay.py --size`, which is the authoritative model.
-
-| Tier | Renditions | ~vCPU/ch | 7 ch | 20 ch |
-| :--- | :--- | :--- | :--- | :--- |
-| **0 — passthrough** *(default)* | source, remux | ~0.1 | D4s v6 | D8s v6 |
-| 1 | + 720p | ~1.3 | F16als v6 | F32als v6 |
-| 2 | + 720p + 480p | ~2.1 | F32als v6 | F48als v6 |
-
-**Tier 0 is genuinely sufficient** for campus Apple TVs at fixed 1080p; higher tiers exist for a
-future phone/off-campus audience.
-
-Tier 0 uses the SMT-enabled **D-series** (cheaper per vCPU, and remuxing is not CPU-bound).
-Tiers >0 use the **v6 F-family** (Fasv6/Falsv6, AMD EPYC 9004) because it ships *without SMT* —
-1 vCPU = 1 physical core, which matters materially for x264 throughput and per-core determinism.
-Pinning a D-series size at tier >0 is rejected by validation.
-
-## Repository split
-
-Mirrors `page-stream` / `page-stream-config` in shape, so the idioms transfer.
-
-| Repo | Contents |
+| | |
 | :--- | :--- |
-| **`pu-shd/stream-relay`** (this repo) | The engine. Bicep IaC, scripts, MediaMTX Dockerfile, local compose stack, engine tests. Department-agnostic — no ORFE specifics, no resource names. |
-| **`pu-shd/stream-relay-config`** | The deployment. `<dept>/relay.yml` (the only file anyone edits), generated `mediamtx.yml` / `deploy.env` / `ingest-urls.env` / `infra.bicepparam`, GitOps workflows, validation suite. |
+| VM (`Standard_D2s_v6`) | $72.72 |
+| egress (3,240 GB) | $281.88 |
+| **total** | **~$355/mo** |
 
-Both are private. The split is structural, not a visibility boundary.
+Run `tools/render-relay.py <dept> --size` in the config repo for the current projection.
+Bitrate is the highest-leverage lever; VM size is not, because remuxing is an I/O job.
+Measured: eight channels publishing simultaneously drew 13.4% of one core.
 
-**`relay.yml` is the single source of truth.** Everything derivable is generated, and
-`--check` fails CI on drift. Two of the three faults behind the July 2026 channel mix-up in
-`page-stream` were dual-maintenance drift; this is the same guard.
+A budget with forecast alerts is provisioned by the deployment. Forecast matters — once
+actual spend crosses a ceiling the money is already gone.
 
-## Quick start
-
-```bash
-# 1. Validate the config and see what it would cost
-cd ../stream-relay-config
-orfe/tests/run-tests.sh                # containerized; needs only Docker
-orfe/tests/run-tests.sh --size         # derived VM size + projected monthly bill
-
-# 2. Prove the whole path works locally — no cloud, no spend
-cd ../stream-relay
-tests/integration/test-publish-to-hls.sh    # 18 assertions, SRT -> MediaMTX -> ffprobe
-
-# 3. Bring the local stack up to watch it
-export SRT_PUBLISH_PASSPHRASE=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 40)
-docker-compose -f docker-compose.local.yml --profile testsrc up -d
-open http://127.0.0.1:8888/news/index.m3u8
-
-#    Publish from page-stream instead of the test pattern:
-#    node dist/index.js --url https://orfe.princeton.edu/news \
-#      --ingest "srt://127.0.0.1:8890?streamid=publish:news&passphrase=$SRT_PUBLISH_PASSPHRASE&pbkeylen=32"
-
-# 4. Deploy to Azure (interactive, resumable) — NOT YET IMPLEMENTED, see Status
-scripts/bootstrap.sh
-```
-
-## Scripts
-
-All follow the same conventions as `page-stream`'s `bootstrap-runner.sh`: ANSI colour, `[n/N]`
-step headers, `✓`/`✗`/`⚠` glyphs, numbered menus.
-
-| Script | Purpose |
-| :--- | :--- |
-| `bootstrap.sh` | Interactive first run: preflight, `az login`, subscription/region pickers, name and tier prompts, then RG → ACR → Key Vault → UAMI → federated credential → VM → Front Door. Prints the DNS block and the GitOps `vars` to set. |
-| `deploy.sh` | Non-interactive, idempotent, CI-callable. `--tier`, `--dry-run` (Bicep `what-if`), `--print-dns-only`. |
-| `update.sh` | Config/image roll without recreating infra. Verifies every path serves HLS; rolls back on failure. |
-| `teardown.sh` | `--soft` (delete VM + Front Door, keep ACR/KV/UAMI → back to ~$5/mo) or `--hard` (delete the resource group). Requires typing the RG name; `--yes` for CI. |
-| `restrict.sh` | **Kill switch.** Flips the endpoint to the campus + VPN allowlist immediately. Works even with `pugwips.enabled: false`, falling back to the static ranges. |
-| `allow-all.sh` | Break-glass: removes the allowlist when it has locked out the displays. |
-
-### Resumability
-
-Every script is resumable, because Front Door certificate issuance alone can take 24–48 hours.
-
-- State lives in `.stream-relay-state.json` (gitignored): `{step, status, resource_ids}`.
-- **Every step is idempotent and independently verifiable** — it re-queries Azure before acting,
-  so a resumed run converges even if the state file is stale or deleted. **State is an
-  accelerator, not the source of truth.**
-- Flags: `--resume`, `--step <name>`, `--from <name>`, `--list-steps`, `--reset-state`.
-- A `trap` on `ERR`/`INT` records the failed step and prints the exact `--from` command to
-  resume. State is written *after* verification, never before acting, so a step is never
-  recorded half-done.
-- Slow steps poll with a spinner, a real timeout, and a note about what they are waiting on.
-
-## Custom domain (two-phase)
-
-`domain` is optional throughout. Front Door will not issue a certificate until DNS exists, so:
-
-**Phase A — no DNS yet (`domain: null`).** Live and fully testable at
-`https://<endpoint>.azurefd.net/<path>/index.m3u8`. Only the hostname is ugly.
-
-**Phase B — when `stream.orfe.princeton.edu` exists.** Set `domain:` in `relay.yml`, re-run
-`deploy.sh`. It prints a copy-pasteable request for whoever runs Princeton DNS:
-
-```
-TXT    _dnsauth.stream.orfe.princeton.edu   <validation-token>
-CNAME  stream.orfe.princeton.edu            <endpoint>.azurefd.net
-CAA    orfe.princeton.edu                   0 issue "digicert.com"   # if CAA is enforced
-```
-
-Front Door needs **both** the TXT (ownership) and the CNAME. `deploy.sh` then polls
-`Pending → Approved → Certificate issued`, resumable across days.
-`--print-dns-only` emits the block without touching anything, so the DNS ticket can be filed
-before any spend.
-
-> Keep the `*.azurefd.net` hostname working permanently as a fallback. The rendered
-> `mdm/vlc.xml` uses whichever hostname is currently valid — **the Apple TVs must never be
-> blocked on a DNS ticket.**
-
-## Security model
-
-**No secrets in any cloud deployment pipeline**, and **two identities** so that no single
-compromise reaches both the infrastructure and the credential.
-
-| Identity | Used by | Roles | Cannot |
-| :--- | :--- | :--- | :--- |
-| `id-orfe-relay-ci` | GitHub Actions (federated) | `Contributor` on the RG, `AcrPush` | read the SRT passphrase; **grant any role** |
-| `id-orfe-relay-vm` | the relay VM | `AcrPull`, `Key Vault Secrets User` | deploy anything; push images |
-
-Why two, and not one: a single identity would be simultaneously too weak for CI (`az acr
-build` needs push and task-run rights, so `AcrPull` alone fails at the build step) and far
-too strong for the VM, which sits on a public IP with an internet-facing UDP listener. If
-that VM is compromised, its identity must not be able to redeploy the infrastructure or push
-the very image it will later execute.
-
-| Hop | Mechanism | Secret stored? |
-| :--- | :--- | :--- |
-| GitHub Actions → Azure | `-ci` identity + federated credential; `azure/login@v2` with the three IDs in **`vars`** | none |
-| VM → ACR | `-vm` identity; `az login --identity` → `az acr login`, refreshed by a systemd timer | none |
-| VM → SRT passphrase | **Key Vault**, read at boot by the `-vm` identity | in Key Vault only |
-| `page-stream` → relay | Publisher-side passphrase from the config repo's existing repository secrets | pre-existing |
-
-### CI cannot escalate its own privileges
-
-`main.bicep` creates role assignments, and creating those requires **User Access
-Administrator** — which would let a compromised workflow grant itself any role in the
-resource group. So RBAC creation is gated:
-
-| Runner | Flag | Needs | Creates RBAC? |
-| :--- | :--- | :--- | :--- |
-| Human bootstrap, once | `--with-role-assignments` | Owner / UAA | yes |
-| CI, every deploy after | *(default)* | **Contributor only** | no |
-
-Role assignments do not change between deploys, so this costs nothing in convenience.
-`preflight` fails **closed** if the VM identity exists without `Key Vault Secrets User` —
-otherwise a first-ever CI deploy would report success and leave a relay unable to read its own
-passphrase, a fault that surfaces much later as a dead stream.
-
-### The `production` environment gate is not separation of duties
-
-`deploy.yml` gates the billable job on a GitHub environment with a required reviewer. With a
-**single reviewer who is also the person dispatching the workflow** — and with
-`can_admins_bypass: true` — that gate is a confirmation prompt and an audit trail, not a
-control. It is documented here so nobody later mistakes it for one. Its other purpose is
-real: the OIDC subject becomes `repo:…:environment:production`, which is a distinct federated
-credential from the branch subject.
-
-Notes:
-
-- The three Azure IDs are **not sensitive**; `vars` is deliberate. Microsoft's docs store them as
-  secrets, which is unnecessary and obscures diffs.
-- **GHCR is not used.** It has no managed-identity path and would force a stored PAT on the VM.
-  CI pushes to ACR; the VM pulls from ACR with its identity.
-- Avoid wildcard ("flexible") federated credential subjects — GA status unconfirmed. Enumerate
-  branch and environment subjects explicitly.
-- `az acr login` mints a short-lived token, so a systemd timer refreshes it on long-running hosts.
-- The GitOps workflow uses `environment: production` with a required reviewer, so real spend is
-  gated behind a human click.
-- MediaMTX's API and metrics bind to **loopback only** and are never exposed by the NSG.
-
-## Cost guardrails
-
-**HLS is public by default**, which makes the egress downside unbounded — the ~$423/mo egress
-figure assumes 10 Apple TVs, and nothing stops a scraper from multiplying it. These are
-provisioned by Bicep, not added by hand:
-
-- **Front Door WAF rate-limit rule**, per socket IP. Available on **Front Door Standard** —
-  only *managed* rule sets (OWASP CRS) require Premium, so no tier upgrade is needed. Set the
-  threshold well above a legitimate LL-HLS player's segment cadence; alert before blocking.
-- **Azure Budget + cost anomaly alert** on the resource group, at two thresholds
-  (`budget_warn_usd`, `budget_alert_usd`).
-- **`scripts/restrict.sh`** as the documented response to a bandwidth incident — tested in the
-  rehearsal drill, not first attempted during one.
-- `egress.expected_viewers` in `relay.yml` feeds the projection, and CI flags a config whose
-  declared viewers imply spend above `monthly_cost_ceiling_usd`.
-
-## Optional: pugwips allowlist
-
-Off by default (`pugwips.enabled: false`), since HLS is public by default. It is the lever to
-pull if the open endpoint is abused.
-
-[`pugwips`](https://github.com/PrincetonUniversity/pugwips) resolves Princeton GlobalProtect
-gateway IPs and publishes them as a signed `gateways.json` release, with an `update_nsg` Function
-and an `update-ip-restrictions.sh` example already written.
-
-- **Ingest side:** NSG rule on `8890/udp` limited to the runner's egress IP + campus + VPN ranges.
-- **Egress side:** Front Door WAF custom rule allowlisting campus + VPN for `/*/index.m3u8`.
-- **Refresh:** scheduled workflow, **retaining pugwips' fail-safe** — if `gateways.json` cannot be
-  fetched, keep the existing rules rather than locking everyone out.
-- Reading the release needs a token, which is why this is opt-in rather than default.
+---
 
 ## Testing
 
-Mock-first. Nothing in the default suite touches Azure or spends money.
-
-| Suite | What it proves | Needs |
-| :--- | :--- | :--- |
-| `stream-relay-config/orfe/tests` | `relay.yml` → generated files; path/producer uniqueness; tier→SKU sizing; drift `--check`; secret hygiene; agreement with `page-stream-config` | Docker |
-| `tests/mock-az/` | An `az` shim earlier on `PATH` returns canned JSON, so all four scripts run offline. Asserts argv, **idempotency** (a second run makes no mutating calls), **resumability** (kill at step *n*, `--resume`, converge), teardown ordering, and that `--soft` leaves ACR/KV/UAMI alive. | bash |
-| `tests/integration/` | Real `page-stream` container publishes SRT to a real MediaMTX; `ffprobe` asserts a valid manifest, ≥2 segments, expected resolution, non-zero frames, and that `runOnAvailable` fired at tier 1 | Docker |
-| `tests/bicep/` | `az bicep build` + `az deployment group what-if`. Gated on `LIVE=1`, matching the existing convention. | `az`, a subscription |
-
 ```bash
-cd ../stream-relay-config && orfe/tests/run-tests.sh   # config validation
-tests/run-tests.sh                                     # engine: mock-az + integration
-LIVE=1 tests/run-tests.sh                              # + real Bicep what-if
+tests/mock-az/run.sh                 # 33 assertions, offline, no cloud
+tests/integration/test-live-relay.sh # against a real deployment
 ```
 
-## Cutover runbook
+The offline suite proves the step machine is idempotent, resumable and state-free, that
+preflight fails closed, that the passphrase never reaches an `az` argv, and that teardown
+deletes nothing it does not own.
 
-Activating the fallback is a flag flip, not an archaeology exercise.
+---
+
+## Teardown
 
 ```bash
-# 1. Stand up the relay (resumable; ~30 min with images already in ACR)
-scripts/bootstrap.sh --resume
-
-# 2. Verify every path serves HLS
-scripts/verify.sh
-
-# 3. Repoint page-stream at the relay
-cd ../page-stream-config
-python3 tools/render-config.py orfe --profile relay
-git commit -am "Cut over to stream-relay" && git push
-
-# 4. Deploy the page-stream stack (existing GitOps workflow)
-gh workflow run deploy.yml
-
-# 5. Push the regenerated mdm/vlc.xml to the Apple TVs, then verify each display
+scripts/teardown.sh --keep-ip --keep-registry
 ```
 
-Reverting is the same sequence with `--profile kaltura`. `channels.yml` keeps both `entry_id`
-and `relay_path`, so both profiles stay fully described at all times and neither is a
-reconstruction job.
+Removes the SRT ingest rule, the budget, the CI identity and the relay container. Leaves the
+VM, its NIC, vnet, NSG, public IP, Key Vault and disks, all of which are adopted — and
+leaves the `:443` and `:80` rules, because other services on the host depend on them.
 
-## Rehearsal drill
+Deleting the resource group is refused when `SHARED_RESOURCE_GROUP` is not exactly `false`,
+and fails closed when the flag is absent.
 
-**A cold standby nobody rehearses is not a fallback.** A scheduled workflow runs quarterly:
-full deploy → integration assertions against the live endpoint → `restrict.sh` exercise →
-teardown → report. It is the only defence against standby rot, and it is where the real
-cutover timings in this README come from.
-
-## Porting to GCP
-
-Should Azure become unavailable, the MediaMTX layer is unchanged. Swap:
-
-| Azure | GCP |
-| :--- | :--- |
-| Bicep | Terraform / Deployment Manager |
-| Front Door Standard | Media CDN (has a documented livestream optimization Front Door lacks) |
-| Public IP / Standard LB (UDP) | Regional external passthrough Network LB (UDP) |
-| UAMI + federated credential | Workload Identity Federation |
-| Key Vault | Secret Manager |
-| ACR | Artifact Registry |
-
-Do not build both. This table exists so the choice can be revisited, not hedged.
+---
 
 ## Troubleshooting
 
-**Publisher connects then immediately drops with `connection is encrypted, but no passphrase is
-defined in configuration`.** The secret is in the wrong place. It belongs in the URL's
-`?passphrase=` parameter, **not** as a fourth `streamid` field — see
-[the publish credential](#the-publish-credential-is-srt-wire-encryption). Also confirm the relay
-actually loaded a passphrase: the entrypoint logs `rendered … (passphrase substituted)`.
-
-**Publisher is rejected with no useful message.** Passphrase shorter than 10 or longer than 79
-characters — libsrt rejects it at handshake time. The entrypoint catches this server-side, but the
-publisher's copy is unchecked.
-
-**Container exits immediately with `config template not found`.** The config repo's `<dept>/`
-directory is not mounted at `/config`. On macOS + Colima, note that `/tmp` is **not** a shared
-path — mount from somewhere under `$HOME`.
-
-**`index.m3u8` returns 404.** Nothing is publishing to that path yet. MediaMTX creates the HLS
-muxer on first publish. Check `mediamtx` logs and `RELAY_PATHS` in `deploy.env`.
-
-**Stale playlist for hours or days.** The Front Door cache rule is missing. MediaMTX emits no
-`Cache-Control`, and Front Door then assigns a **random 1–3 day TTL**. The explicit rule in
-`infra/main.bicep` is load-bearing — do not remove it.
-
-**Viewers buffer on one channel only.** That channel is at tier 0 while its source is above the
-VM's headroom, or a tier >0 hook is thrashing. Check `runOnAvailableRestart` loops in the logs
-and re-run `--size`.
-
-**Certificate stuck `Pending`.** Both DNS records must exist — the `_dnsauth` TXT *and* the
-CNAME. Verify from outside with `tools/check-dns.sh`; issuance takes 24–48 h after validation.
-
-**`az acr login` fails on the VM.** The managed-identity token expired. Confirm the systemd
-refresh timer, and that the identity holds `Container Registry Repository Reader` (ABAC
-registries) or `AcrPull` (non-ABAC).
-
-**Everything locked out after enabling pugwips.** Run `scripts/allow-all.sh`. Then check whether
-the `gateways.json` fetch failed and the fail-safe did not engage.
+| Symptom | Cause |
+| :--- | :--- |
+| Publisher connects, then drops | Wrong passphrase. SRT wire encryption is the credential — `?passphrase=…&pbkeylen=32`, not the streamid's `user:pass` field. |
+| Playlist stops advancing, ingest looks healthy | `hlsAlwaysRemux` is off. nginx reads the directory rather than connecting as a client, so MediaMTX sees no readers and closes the muxer. |
+| Viewers blocked, allowlist looks right | VPN egress ranges. See Access control. |
+| Every display dark at once | The `443` allowlist. Check a viewer's egress address against the configured ranges. |
+| `BCP091` on deploy | The engine and config repos must be siblings; `infra.bicepparam` names its template relatively. |
+| Container healthy, nothing on screen | The publisher is not publishing. `docker exec stream-relay wget -qO- http://127.0.0.1:9997/v3/paths/list` — the API answers only from inside the container. |
 
 ---
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md).
+See [LICENSE.md](LICENSE.md).

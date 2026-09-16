@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# teardown.sh — remove the relay. COMPLETE BY DEFAULT.
+# teardown.sh — remove the relay's own resources. Never the host it runs on.
 #
-#   scripts/teardown.sh                       # complete: delete the resource group -> ~$0/mo
-#   scripts/teardown.sh --keep-ip             # keep the static public IP (~$4/mo)
-#   scripts/teardown.sh --keep-registry       # keep ACR warm (~$5/mo, no image rebuild)
-#   scripts/teardown.sh --keep-ip --keep-registry
-#   scripts/teardown.sh --yes                 # skip the typed confirmation (CI)
-#   scripts/teardown.sh --dry-run             # show what would be deleted
+#   scripts/teardown.sh --keep-ip --keep-registry   # the normal call
+#   scripts/teardown.sh --dry-run                   # show what would be removed
+#   scripts/teardown.sh --yes                       # skip the typed confirmation (CI)
 #
-# The default is total removal because the entire cost model rests on this actually
-# happening: a fallback that is awkward to switch off quietly becomes a subscription.
+# Removes: the SRT ingest NSG rule, the budget, the CI identity, and the relay container
+# on the VM. Leaves everything else, because everything else is adopted — the VM, its NIC,
+# vnet, subnet, NSG, static public IP, Key Vault, disks and alert rules all existed before
+# this project and belong to the host. The :443 and :80 rules stay too: VDO.Ninja serves on
+# one and certbot renews over the other.
+#
+# A complete teardown (deleting the resource group) is REFUSED when
+# SHARED_RESOURCE_GROUP is not exactly "false", and fails closed if the flag is absent.
 #
 # WHAT A COMPLETE TEARDOWN CHANGES ON REACTIVATION
 #   * the SRT ingest IP will differ (unless --keep-ip)
