@@ -288,13 +288,22 @@ else
   t_fail "register-providers did not register the unregistered provider"
 fi
 
-# A healthy MediaMTX with a dead mirror delivers nothing, so it must fail the step.
+# Convergence runs ON the relay host. Anywhere else the step must SKIP loudly rather than
+# claim success, and must never reach for `az vm run-command` - that would mean the
+# deploying principal holds arbitrary root execution on the VM, a larger privilege than
+# everything else this deployment has combined.
 reset_state; reset_log
-out=$(run_deploy mirror-down --step configure)
-if [ $? -ne 0 ] && grep -q "mirror" <<<"$out"; then
-  t_ok "a dead HLS mirror fails configure even when MediaMTX is healthy"
+out=$(run_deploy fresh --step configure)
+rc=$?
+if [ "$rc" -eq 0 ] && grep -qi "self-hosted runner's job" <<<"$out"; then
+  t_ok "configure skips off-host instead of pretending to converge"
 else
-  t_fail "configure passed with the mirror down:\n$out"
+  t_fail "configure did not skip off-host (rc=$rc):\n$out"
+fi
+if grep -qE 'vm run-command' "$SANDBOX/az.log"; then
+  t_fail "configure invoked az vm run-command; CI must not hold runCommand on the VM"
+else
+  t_ok "configure never invokes run-command"
 fi
 
 # --- 6. secret hygiene ------------------------------------------------------------------

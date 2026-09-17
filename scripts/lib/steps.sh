@@ -468,82 +468,42 @@ ensure_passphrase() {
 }
 
 do_configure() {
-  require_env AZ_RESOURCE_GROUP AZ_VM_NAME
+  require_env AZ_VM_NAME
   local tmpl="$DEPT_DIR/mediamtx.yml.tmpl"
   [ -f "$tmpl" ] || die "missing $tmpl"
+
+  # Convergence runs ON the relay host, not remotely.
+  #
+  # The alternative is `az vm run-command` from wherever this script happens to run, which
+  # means granting the deploying principal Microsoft.Compute/virtualMachines/runCommand -
+  # arbitrary root command execution on the VM. That is a larger privilege than everything
+  # else this deployment holds combined, and CI does not get it. The self-hosted runner on
+  # the host does this step instead, through one audited script.
+  if [ ! -x /usr/local/bin/relay-apply.sh ]; then
+    skipped "not running on the relay host; convergence is the self-hosted runner's job"
+    detail "this host has no /usr/local/bin/relay-apply.sh, so there is nothing to apply"
+    return 0
+  fi
+
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    info "[dry-run] would upload $(basename "$tmpl") and start stream-relay.service"
+    info "[dry-run] would stage the generated config and run relay-apply.sh"
     return 0
   fi
-  # Run Command rather than SSH: there is no inbound SSH rule in the NSG by design.
-  local encoded
-  encoded=$(base64 < "$tmpl" | tr -d '\n')
 
-  # Wait for cloud-init BEFORE touching the service. Starting it early raced cloud-init's
-  # Azure CLI install and died with "az: command not found", while this step still reported
-  # success - a deployment that looks green with the relay down.
-  info "waiting for cloud-init to finish on the VM (docker + az install)"
-  local ci_status=""
-  local _i
-  for _i in $(seq 1 40); do
-    ci_status=$(az_query vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
-      --command-id RunShellScript --scripts "cloud-init status 2>/dev/null | head -1" \
-      --query "value[0].message" -o tsv 2>/dev/null | grep -o 'status: [a-z]*' | head -1 || true)
-    case "$ci_status" in
-      *done|*disabled) break ;;
-      *error) die "cloud-init failed on the VM; inspect with:
-    az vm run-command invoke -g $AZ_RESOURCE_GROUP -n $AZ_VM_NAME --command-id RunShellScript \\
-      --scripts 'cloud-init status --long; journalctl -u cloud-final --no-pager | tail -40'" ;;
-    esac
-    sleep 15
-  done
-  unset _i
-  ok "cloud-init: ${ci_status:-unknown}"
+  local stage=/opt/stream-relay-staging
+  install -m 0644 "$DEPT_DIR/docker-compose.yml" "$stage/docker-compose.yml"
+  install -m 0644 "$DEPT_DIR/nginx.conf"         "$stage/nginx.conf"
+  install -m 0644 "$tmpl"                        "$stage/mediamtx.yml.tmpl"
 
-  # Run Command rather than SSH: there is no inbound SSH rule in the NSG by design.
-  local result
-  result=$(az vm run-command invoke -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts "set -e
-mkdir -p /etc/stream-relay/config
-echo '$encoded' | base64 -d > /etc/stream-relay/config/mediamtx.yml.tmpl
-systemctl restart stream-relay.service || true
-for i in \$(seq 1 24); do
-  if docker ps --filter name=stream-relay --filter health=healthy --format '{{.Names}}' | grep -q stream-relay; then
-    echo RELAY_HEALTHY; break
+  local out
+  if out=$(sudo -n /usr/local/bin/relay-apply.sh 2>&1); then
+    ok "relay converged: $(grep -o 'RELAY_HEALTHY.*' <<<"$out" || echo healthy)"
+  else
+    printf '%s\n' "$out" | sed 's/^/      /'
+    die "relay-apply.sh failed; the stack is not healthy"
   fi
-  sleep 5
-done
-# The mirror is a SEPARATE unit. cloud-init only enables it (it cannot start before the
-# config exists), so it must be started here - and asserted, or the relay looks healthy
-# while nothing is actually being delivered.
-systemctl restart relay-hls-sync.service || true
-sleep 10
-systemctl is-active --quiet relay-hls-sync && echo MIRROR_ACTIVE
-echo \"service=\$(systemctl is-active stream-relay) mirror=\$(systemctl is-active relay-hls-sync)\"
-docker ps --filter name=stream-relay --format '{{.Status}}' || true
-journalctl -u stream-relay --no-pager -n 8 2>&1 | tail -8
-journalctl -u relay-hls-sync --no-pager -n 8 2>&1 | tail -8" \
-    --query "value[0].message" -o tsv 2>&1)
-
-  local relay_ok=0 mirror_ok=0
-  grep -q 'RELAY_HEALTHY' <<<"$result" && relay_ok=1
-  grep -q 'MIRROR_ACTIVE' <<<"$result" && mirror_ok=1
-
-  if [ "$relay_ok" = "1" ] && [ "$mirror_ok" = "1" ]; then
-    ok "MediaMTX healthy and the HLS mirror is running"
-    return 0
-  fi
-  [ "$relay_ok" = "1" ] && ok "MediaMTX container is healthy"
-  # A healthy MediaMTX with a dead mirror publishes to nobody: segments accumulate on the
-  # VM's disk and the CDN serves 404s. Treat it as a failure of the step, not a warning.
-  [ "$mirror_ok" = "1" ] || fail "the HLS mirror (relay-hls-sync) is not running — nothing reaches Blob Storage"
-
-  fail "the relay did not become healthy after config delivery"
-  printf '%s\n' "$result" | sed 's/^/      /' >&2
-  die "configure-vm failed. Common causes: Key Vault RBAC still propagating (retry the step),
-    or the image tag missing from ACR (re-run --step build-push-image)."
 }
+
 
 do_verify() {
   if [ "${SKIP_VERIFY:-0}" = "1" ]; then
