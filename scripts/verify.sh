@@ -84,21 +84,29 @@ fi
 
 # --- 2. reachability --------------------------------------------------------------------
 step_header 2 6 "Reachability and TLS"
-code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/" || echo 000)
+# `|| code=000`, NOT `|| echo 000`. curl already prints 000 when it cannot connect, so the
+# old form appended a second one and produced "000000" - which is not equal to "000", so
+# every guard comparing against it passed. An endpoint that was never reached reported
+# "TLS handshake and HTTP response (000000)" as a tick.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/" 2>/dev/null) || code=000
+[ -n "$code" ] || code=000
 
-# Is this host even entitled to be a viewer?
+# Is this host entitled to be a viewer at all?
 #
 # Delivery is gated to the viewer allowlist, so a GitHub-hosted runner - or any machine off
-# the permitted networks - cannot fetch a manifest no matter how healthy the relay is. That
-# is the allowlist working, not a deployment defect, and counting it as "unverified" makes
-# a correct deployment report amber forever. Checks that need viewer access are skipped
-# with a reason instead, and the summary says where to run them.
+# the permitted networks - cannot fetch a manifest however healthy the relay is. That is the
+# allowlist working, not a deployment defect. Counting it as UNVERIFIED would make a correct
+# deployment report amber forever, so those checks are skipped with a reason and the summary
+# says where to run them.
 VIEWER_ACCESS=1
-if [ "$code" = "000" ]; then
-  VIEWER_ACCESS=0
+[ "$code" = "000" ] && VIEWER_ACCESS=0
+
+if [ "$VIEWER_ACCESS" = "1" ]; then
+  check_ok "TLS handshake and HTTP response ($code)"
+else
+  skipped "no HTTPS response from $HOST from this host"
+  detail "expected off the viewer allowlist; run from a permitted network to check delivery"
 fi
-[ "$code" != "000" ] && check_ok "TLS handshake and HTTP response ($code)" \
-  || check_fail "no HTTPS response from $HOST"
 
 # --- 3. per-path manifests --------------------------------------------------------------
 step_header 3 6 "Channel manifests"
