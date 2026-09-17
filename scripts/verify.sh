@@ -85,6 +85,18 @@ fi
 # --- 2. reachability --------------------------------------------------------------------
 step_header 2 6 "Reachability and TLS"
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/" || echo 000)
+
+# Is this host even entitled to be a viewer?
+#
+# Delivery is gated to the viewer allowlist, so a GitHub-hosted runner - or any machine off
+# the permitted networks - cannot fetch a manifest no matter how healthy the relay is. That
+# is the allowlist working, not a deployment defect, and counting it as "unverified" makes
+# a correct deployment report amber forever. Checks that need viewer access are skipped
+# with a reason instead, and the summary says where to run them.
+VIEWER_ACCESS=1
+if [ "$code" = "000" ]; then
+  VIEWER_ACCESS=0
+fi
 [ "$code" != "000" ] && check_ok "TLS handshake and HTTP response ($code)" \
   || check_fail "no HTTPS response from $HOST"
 
@@ -109,6 +121,9 @@ elif [ "${REQUIRE_LIVE:-0}" = "1" ]; then
   # --require-live is used by the live test and the rehearsal drill, where a publisher IS
   # running, so zero live channels is a hard failure rather than a shrug.
   check_fail "no channels are serving, but --require-live was set"
+elif [ "$VIEWER_ACCESS" = "0" ]; then
+  skipped "not reachable from this host: the viewer allowlist admits campus networks only"
+  detail "run from a permitted network, or on the relay host, to check delivery"
 else
   warn "no channels are publishing — start page-stream in relay mode to test fully"
   unverified=$(( unverified + 1 ))
@@ -180,8 +195,12 @@ else
   if [ "${REQUIRE_LIVE:-0}" = "1" ]; then
     check_fail "cache behaviour unverified while --require-live was set"
   else
-    warn "cache correctness is UNVERIFIED — re-run with a publisher active"
-    unverified=$(( unverified + 3 ))
+    if [ "$VIEWER_ACCESS" = "0" ]; then
+      skipped "cache behaviour needs viewer access; this host is outside the allowlist"
+    else
+      warn "cache correctness is UNVERIFIED — re-run with a publisher active"
+      unverified=$(( unverified + 3 ))
+    fi
   fi
 fi
 
