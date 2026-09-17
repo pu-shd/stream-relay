@@ -16,7 +16,7 @@ jobs:
     name: Shell lint and syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: bash syntax check
         run: |
@@ -46,7 +46,7 @@ jobs:
     name: Bicep compiles
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: az bicep build
         run: |
           az bicep install
@@ -114,7 +114,7 @@ jobs:
     name: Deployment scripts (mock az)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Run the offline suite
         run: tests/mock-az/run.sh
 
@@ -122,14 +122,14 @@ jobs:
     name: SRT to HLS integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # The suite needs the generated mediamtx.yml.tmpl from the config repo. Without a
       # token it exits 77 ("not configured") rather than failing, so a missing secret
       # degrades to a skip instead of a red build.
       - name: Checkout stream-relay-config
         id: cfg
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         continue-on-error: true
         with:
           repository: pu-shd/stream-relay-config

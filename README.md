@@ -163,6 +163,32 @@ repository inheriting the trust.
 
 ---
 
+## Accepted risks
+
+**A self-hosted runner is root on its host.** The runner's user is in the `docker` group,
+which is root-equivalent — `docker run -v /:/host` yields the whole filesystem — so the
+narrow sudoers rule granting it two scripts bounds nothing. Anyone who can land a workflow
+on that runner can take the host.
+
+This is accepted rather than fixed, and it is a property of self-hosted runners generally,
+not of this design. What bounds it instead:
+
+- Only `workflow_dispatch` workflows reach the runner, and both are gated on a `production`
+  environment with a required reviewer.
+- No `pull_request` or `push` trigger targets it, so untrusted branch code never lands there.
+- Actions are pinned to commit SHAs and images to digests, closing the path where a moved
+  upstream tag becomes code execution.
+
+If the host later runs something that must not share a blast radius with CI, move the runner
+to a dedicated machine rather than trying to de-privilege it in place.
+
+**IMDS is blocked for container networks.** Without that, any container on the host can mint
+a token for the VM's managed identity and read the Key Vault secret — which defeats the
+design where the runner never sees the passphrase. A `DOCKER-USER` rule drops traffic to
+`169.254.169.254` from container networks while leaving the host's own path working, since
+that is how the config is rendered. It is reapplied at boot by a systemd unit, because
+`DOCKER-USER` only exists once dockerd has started.
+
 ## TLS
 
 certbot renews on a loop and nginx reloads on another, both as containers. A one-shot
