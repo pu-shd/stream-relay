@@ -207,8 +207,10 @@ fi
 
 # --- 6. guardrails present --------------------------------------------------------------
 step_header 6 6 "Cost guardrails"
-if az consumption budget show --budget-name relay-budget >/dev/null 2>&1 \
-  || az consumption budget list --query "[?name=='relay-budget']" -o tsv 2>/dev/null | grep -q .; then
+# Scoped to the resource group, which is where the budget is deployed. Without -g the CLI
+# looks at subscription scope, where a principal holding Cost Management Contributor on the
+# resource group cannot see it - so the check reported "no budget" for a budget that exists.
+if az consumption budget show --budget-name relay-budget -g "$AZ_RESOURCE_GROUP" >/dev/null 2>&1; then
   check_ok "budget exists"
 else
   check_fail "no budget found — an unbounded public endpoint with no cost alarm"
