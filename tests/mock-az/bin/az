@@ -23,7 +23,10 @@ resource_exists() {
   # The resource group ALWAYS exists. This deployment adopts a shared group it did not
   # create and refuses to invent one, so "absent" is a fatal misconfiguration rather than a
   # state any scenario should model.
-  [ "$1" = "group" ] && return 0
+  # The resource group, the VM and its Key Vault ALWAYS exist. This deployment adopts a host
+  # it did not create and refuses to invent one, so "absent" is a fatal misconfiguration
+  # rather than a state any scenario should model.
+  case "$1" in group|vm|keyvault) return 0 ;; esac
   case "$MOCK_AZ_SCENARIO" in
     # orphaned-disk models "everything existed, teardown ran, but a disk survived", so the
     # resources must exist or teardown exits early and never reaches the orphan check.
@@ -113,9 +116,11 @@ case "$1 ${2:-} ${3:-} ${4:-}" in
 
   "vm list-usage"*)
     if [ "$MOCK_AZ_SCENARIO" = "no-quota" ]; then
-      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":350,"limit":350}]'
+      # Both families: the deployment may adopt a previous-generation host, so a fixture
+      # naming only the current family makes the check inconclusive rather than failing.
+      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":350,"limit":350},{"localName":"Standard Dsv5 Family vCPUs","currentValue":350,"limit":350}]'
     else
-      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":0,"limit":350}]'
+      emit '[{"localName":"Standard Dsv6 Family vCPUs","currentValue":0,"limit":350},{"localName":"Standard Dsv5 Family vCPUs","currentValue":0,"limit":350}]'
     fi
     ;;
 
@@ -190,6 +195,7 @@ case "$1 ${2:-} ${3:-} ${4:-}" in
     ;;
 
   "vm show"*) resource_exists vm || exit 1 ;;
+  "keyvault show"*) resource_exists keyvault || exit 1 ;;
   "vm delete"*) ;;
   "vm run-command invoke"*)
     # configure-vm asks two different things through Run Command: whether cloud-init has

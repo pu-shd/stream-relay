@@ -160,6 +160,35 @@ do_preflight() {
     fi
   fi
 
+  # Capability checks, not role-name checks.
+  #
+  # The template ADOPTS the VM and the vault - it references both as `existing` - and
+  # reading an existing resource needs read permission on it. No role name implies that:
+  # Network Contributor and Cost Management Contributor between them cover everything this
+  # deployment WRITES and nothing it READS, which is a combination that looks complete and
+  # is not.
+  #
+  # `az deployment group what-if` does not catch it either. What-if computes a diff; it does
+  # not evaluate authorization for resources the template merely reads, so it returns
+  # success and the deployment then fails mid-flight with AuthorizationFailed. Asking the
+  # question directly is the only cheap way to fail before anything is attempted.
+  if [ -n "${AZ_VM_NAME:-}" ] && ! exists vm show -g "$AZ_RESOURCE_GROUP" -n "$AZ_VM_NAME"; then
+    fail "cannot read the adopted VM $AZ_VM_NAME"
+    die "the template references it as \`existing\`, so the deployment needs
+    Microsoft.Compute/virtualMachines/read on it. Grant Reader scoped to the VM:
+
+      az role assignment create --assignee-object-id <principal> \\
+        --assignee-principal-type ServicePrincipal --role Reader \\
+        --scope \$(az vm show -g $AZ_RESOURCE_GROUP -n $AZ_VM_NAME --query id -o tsv)"
+  fi
+  [ -n "${AZ_VM_NAME:-}" ] && ok "can read the adopted VM $AZ_VM_NAME"
+
+  if [ -n "${AZ_KEY_VAULT:-}" ] && ! exists keyvault show -n "$AZ_KEY_VAULT"; then
+    fail "cannot read the adopted Key Vault $AZ_KEY_VAULT"
+    die "the template references it as \`existing\`. Grant Reader scoped to the vault."
+  fi
+  [ -n "${AZ_KEY_VAULT:-}" ] && ok "can read the adopted Key Vault $AZ_KEY_VAULT"
+
   # Quota for the *derived* size, not a hardcoded one.
   require_env AZ_REGION AZ_VM_SIZE AZ_VM_VCPU
   local family_used family_limit
