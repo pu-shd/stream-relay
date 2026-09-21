@@ -23,7 +23,8 @@ WHERE THE NUMBERS COME FROM
                permanently 0 and hlsmuxers reports outboundBytes 0 on a path an Apple TV
                is actively playing. Verified on the live relay, not assumed.
 
-  Certificate  `openssl x509 -enddate` against the mounted certbot volume.
+  Certificate  the TLS handshake with nginx - what is actually SERVED, which is not
+               the same as what is on disk after a renewal nginx has not reloaded.
 
 THREE SEVERITIES, and the distinction is the whole point:
 
@@ -54,7 +55,17 @@ METRICS_URL = os.environ.get("METRICS_URL", "http://stream-relay:9998/metrics")
 NGINX_HEALTH = os.environ.get("NGINX_HEALTH", "https://nginx/healthz")
 ACCESS_LOG = os.environ.get("ACCESS_LOG", "/var/log/relay/access.log")
 STATUS_PATH = os.environ.get("STATUS_PATH", "/srv/relay-status/status.json")
-CERT_PATH = os.environ.get("CERT_PATH", "")
+# The certificate is read off the TLS HANDSHAKE, not off disk.
+#
+# Two reasons, and the second is the one that matters. certbot keeps live/ and archive/
+# at 0700 root, so an unprivileged watchdog cannot read the file without loosening
+# permissions on a directory that also holds the private key. And the file is the wrong
+# thing to measure: a renewed certificate that nginx has not reloaded still serves the
+# OLD one, so the file would report healthy while every viewer gets an expired cert.
+# The handshake reports what is actually served.
+TLS_HOST = os.environ.get("TLS_HOST", "nginx")
+TLS_PORT = int(os.environ.get("TLS_PORT", "443"))
+TLS_SNI = os.environ.get("TLS_SNI", "")
 INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
 
 # `-` not `:-`: an UNSET variable is a different fault from one the render set to empty.
@@ -157,11 +168,39 @@ class LogTail:
 
 
 def cert_days_left() -> float | None:
-    if not CERT_PATH or not os.path.exists(CERT_PATH):
+    """Days until the certificate nginx is currently SERVING expires."""
+    import ssl
+
+    if not TLS_SNI:
+        print("[watchdog] TLS_SNI is unset; cannot check the certificate",
+              file=sys.stderr)
         return None
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # Not verifying: the certificate is issued for the public name and this connects to
+    # the container by its compose alias, so the hostname would never match and the CA
+    # path is not the question. What is wanted is the peer's notAfter. SNI is still sent,
+    # so nginx picks the right certificate.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((TLS_HOST, TLS_PORT), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=TLS_SNI) as tls:
+                der = tls.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError) as exc:
+        print(f"[watchdog] TLS handshake with {TLS_HOST}:{TLS_PORT} failed: {exc}",
+              file=sys.stderr)
+        return None
+    if not der:
+        return None
+
+    # getpeercert() returns {} under CERT_NONE, so the DER is decoded instead. openssl
+    # rather than hand-parsing: getting DER date arithmetic subtly wrong would make this
+    # check quietly always pass, which is worse than not having it.
     try:
         out = subprocess.run(
-            ["openssl", "x509", "-enddate", "-noout", "-in", CERT_PATH],
+            ["openssl", "x509", "-enddate", "-noout"],
+            input=ssl.DER_cert_to_PEM_cert(der),
             capture_output=True, text=True, timeout=10, check=True,
         ).stdout.strip()
     except (subprocess.SubprocessError, OSError) as exc:
@@ -355,7 +394,9 @@ def collect(previous: dict) -> dict:
 
     days = cert_days_left()
     if days is None:
-        faults.append(f"could not read the certificate at {CERT_PATH or '(unset)'}")
+        faults.append(
+            f"could not read the certificate served by {TLS_HOST}:{TLS_PORT}"
+        )
     elif days < CERT_DAYS_FAIL:
         problems.append(f"certificate expires in {days:.1f} days")
     elif days < CERT_DAYS_WARN:

@@ -15,26 +15,80 @@ import os
 import shutil
 import subprocess
 import sys
+import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WATCHDOG = REPO_ROOT / "docker" / "watchdog" / "watchdog.py"
 
-# A real certificate for the default environment, so the openssl path runs for real in
-# every case rather than being stubbed. An absent CERT_PATH is itself a fault - correctly,
-# since the compose always sets it - which would otherwise make every unrelated case
-# unhealthy for the wrong reason.
-_CERT_DIR = tempfile.mkdtemp()
-GOOD_CERT = os.path.join(_CERT_DIR, "fullchain.pem")
-subprocess.run(
-    ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "90",
-     "-subj", "/CN=relay-test", "-keyout", os.path.join(_CERT_DIR, "key.pem"),
-     "-out", GOOD_CERT],
-    capture_output=True, check=True,
-)
-atexit.register(lambda: shutil.rmtree(_CERT_DIR, ignore_errors=True))
+def _make_cert(days: int, directory: str) -> tuple[str, str]:
+    cert = os.path.join(directory, "fullchain.pem")
+    key = os.path.join(directory, "key.pem")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", str(days),
+         "-subj", "/CN=relay-test", "-keyout", key, "-out", cert],
+        capture_output=True, check=True,
+    )
+    return cert, key
+
+
+class TLSServer:
+    """A throwaway TLS listener presenting a certificate with a chosen lifetime.
+
+    The expiry check reads the certificate off the HANDSHAKE rather than off disk, so it
+    is exercised against a real handshake. Stubbing it would test nothing: the whole
+    point of the change was that the served certificate and the file can differ.
+    """
+
+    def __init__(self, days: int):
+        import ssl as _ssl
+        self.dir = tempfile.mkdtemp()
+        cert, key = _make_cert(days, self.dir)
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self._ctx = ctx
+        self._stop = False
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            try:
+                with self._ctx.wrap_socket(conn, server_side=True):
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+# One long-lived certificate for the default environment, so unrelated cases are not
+# failed by a certificate fault they are not about.
+_DEFAULT_TLS = TLSServer(90)
+atexit.register(_DEFAULT_TLS.close)
 
 
 def load_watchdog(**env):
@@ -48,7 +102,9 @@ def load_watchdog(**env):
         "NGINX_HEALTH": "http://127.0.0.1:1/healthz",
         "ACCESS_LOG": "/nonexistent",
         "STATUS_PATH": "/nonexistent/status.json",
-        "CERT_PATH": GOOD_CERT,
+        "TLS_HOST": "127.0.0.1",
+        "TLS_PORT": str(_DEFAULT_TLS.port),
+        "TLS_SNI": "relay-test",
         "HEALTHCHECKS_URL": "",
         "RELAY_PATHS": "live-events,news",
         "EXPECTED_PUBLISHERS": "live-events",
@@ -325,43 +381,42 @@ class ViewerTelemetry(unittest.TestCase):
 
 
 class Certificate(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+    """Read from the handshake, so it reports what nginx is SERVING.
 
-    def _cert(self, days):
-        path = os.path.join(self.dir, "fullchain.pem")
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-             "-days", str(days), "-subj", "/CN=relay-test",
-             "-keyout", os.path.join(self.dir, "key.pem"), "-out", path],
-            capture_output=True, check=True,
-        )
-        return path
+    A renewal that nginx has not reloaded leaves the old certificate on the wire while a
+    fresh one sits on disk. Checking the file would report healthy through exactly that
+    outage - and certbot keeps live/ at 0700 root anyway, so reading it would have meant
+    loosening a directory that also holds the private key.
+    """
+
+    def _snap(self, days):
+        server = TLSServer(days)
+        self.addCleanup(server.close)
+        mod = load_watchdog(TLS_HOST="127.0.0.1", TLS_PORT=str(server.port),
+                            TLS_SNI="relay-test")
+        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        return mod.collect({"paths": {"live-events": {"bytes": 1000}}})
 
     def test_a_healthy_certificate_is_silent(self):
-        mod = load_watchdog(CERT_PATH=self._cert(90))
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
-        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        snap = self._snap(90)
         self.assertEqual(snap["warnings"], [])
         self.assertGreater(snap["cert_days_left"], 80)
 
-    def test_an_expiring_certificate_warns_then_fails(self):
-        """The adopted deployment ran `certonly` once and its certificate expired on
-        2026-05-03 with nothing saying so."""
-        mod = load_watchdog(CERT_PATH=self._cert(14))
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
-        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+    def test_an_expiring_certificate_warns_but_does_not_fail(self):
+        snap = self._snap(14)
         self.assertTrue(snap["healthy"], "21 days out is a warning, not an outage")
         self.assertTrue(any("certificate" in w for w in snap["warnings"]))
 
-        mod = load_watchdog(CERT_PATH=self._cert(3))
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
-        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
-        self.assertFalse(snap["healthy"], "3 days out must fail")
+    def test_an_almost_expired_certificate_fails(self):
+        """The adopted deployment ran `certonly` once and its certificate expired on
+        2026-05-03 with nothing saying so."""
+        snap = self._snap(3)
+        self.assertFalse(snap["healthy"])
+        self.assertTrue(any("certificate" in p for p in snap["problems"]))
 
-    def test_an_unreadable_certificate_is_a_fault(self):
-        mod = load_watchdog(CERT_PATH="/nonexistent/fullchain.pem")
+    def test_an_unreachable_listener_is_a_fault_not_a_pass(self):
+        """Cannot-see, again. A silent None here would read as a healthy certificate."""
+        mod = load_watchdog(TLS_HOST="127.0.0.1", TLS_PORT="1", TLS_SNI="relay-test")
         fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertTrue(any("certificate" in f for f in snap["faults"]), snap["faults"])
