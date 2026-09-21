@@ -58,6 +58,10 @@ AZ_VM_NAME=vm-example-relay
 AZ_VM_SIZE=Standard_D2s_v6
 AZ_VM_VCPU=2
 AZ_DNS_LABEL=example-relay
+# Present so the publishing guard is exercised whether or not the config repo is
+# checked out beside this one. A fixture that omits it would leave that guard untested
+# in exactly the environment CI runs in.
+RELAY_EXPECTED_PUBLISHERS=example-live
 HOSTS=relay-1
 DEFAULT_HOST=relay-1
 AZ_NSG_NAME=vm-example-relay-nsg
@@ -328,7 +332,8 @@ reset_log
 MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=existing \
   PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
   STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
-  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes >"$SANDBOX/teardown.out" 2>&1
+  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes --abandon-channels \
+    >"$SANDBOX/teardown.out" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && t_ok "selective teardown succeeded" || { t_fail "selective teardown failed:"; sed 's/^/      /' "$SANDBOX/teardown.out"; }
 
@@ -391,7 +396,7 @@ run_teardown() {
   reset_log
   MOCK_AZ_LOG="$SANDBOX/az.log" PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$1" \
     STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
-    "$REPO_ROOT/scripts/teardown.sh" --yes >"$SANDBOX/guard.out" 2>&1
+    "$REPO_ROOT/scripts/teardown.sh" --yes --abandon-channels >"$SANDBOX/guard.out" 2>&1
   return $?
 }
 
@@ -410,6 +415,46 @@ if grep -q 'refusing to delete' "$SANDBOX/guard.out" \
   t_ok "a missing SHARED_RESOURCE_GROUP flag fails closed"
 else
   t_fail "a missing SHARED_RESOURCE_GROUP flag did NOT fail closed"
+fi
+
+# ---------------------------------------------------------------------------------------
+# The publishing guard. Tearing down takes live channels off the air, and page-stream will
+# not notice: its SRT backoff reconnects forever rather than exiting, so every container
+# stays healthy while the displays hold their last frame.
+# ---------------------------------------------------------------------------------------
+reset_log
+MOCK_AZ_LOG="$SANDBOX/az.log" PATH="$MOCK_BIN:$PATH" CONFIG_REPO="$CONFIG" \
+  STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
+  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes \
+  >"$SANDBOX/live.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'publishing to this relay right now' "$SANDBOX/live.out" \
+   && ! grep -qE 'nsg rule delete|identity delete|budget delete' "$SANDBOX/az.log"; then
+  t_ok "teardown refuses while a channel is publishing, and deletes nothing first"
+else
+  t_fail "teardown did NOT refuse while a channel is publishing"
+  sed 's/^/      /' "$SANDBOX/live.out"
+fi
+
+# Overridable, or a relay whose channels have moved on could never be retired.
+reset_log
+MOCK_AZ_LOG="$SANDBOX/az.log" MOCK_AZ_SCENARIO=existing PATH="$MOCK_BIN:$PATH" \
+  CONFIG_REPO="$CONFIG" STREAM_RELAY_STATE_FILE="$SANDBOX/state.json" \
+  "$REPO_ROOT/scripts/teardown.sh" --keep-ip --keep-registry --yes --abandon-channels \
+  >"$SANDBOX/abandon.out" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  t_ok "--abandon-channels proceeds past the refusal"
+else
+  t_fail "--abandon-channels did not proceed"
+  sed 's/^/      /' "$SANDBOX/abandon.out"
+fi
+
+# The watchdog is stopped BEFORE the relay, so deliberate work does not page.
+if grep -q 'relay-watchdog' "$SANDBOX/abandon.out" || grep -q 'relay-watchdog' "$SANDBOX/az.log"; then
+  t_ok "teardown stops the watchdog as well as the relay"
+else
+  t_fail "teardown leaves the watchdog running; it would page about planned work"
 fi
 
 # A vault the relay did not create is never purged, even when the group IS dedicated -
