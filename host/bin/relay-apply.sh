@@ -27,8 +27,23 @@ if [ -d "$STAGE/watchdog" ]; then
   install -m 0644 "$STAGE/watchdog/watchdog.py" "$PROJECT/watchdog/watchdog.py"
 fi
 
-# Where the watchdog writes its snapshot for the scheduled workflow to read.
-install -d -m 0755 /srv/relay-status
+# The watchdog's two writable directories, owned by the uid it runs as.
+#
+# nginx runs as root and creates the access log root:root, which an unprivileged watchdog
+# cannot truncate - and truncating is the only thing bounding a file that Docker's log
+# rotation does not touch. Pre-creating the file here, owned by the watchdog, means nginx
+# opens the existing inode O_APPEND (root can write a file it does not own) and the
+# watchdog can still drain it.
+#
+# WATCHDOG_UID must match the Dockerfile. A cross-repo test pins the two together, after
+# a mismatch produced a watchdog that started, reported permission errors every pass, and
+# wrote no snapshot at all.
+WATCHDOG_UID=10001
+install -d -m 0755 -o "$WATCHDOG_UID" -g "$WATCHDOG_UID" /srv/relay-status
+install -d -m 0755 -o "$WATCHDOG_UID" -g "$WATCHDOG_UID" /srv/relay-logs
+[ -e /srv/relay-logs/access.log ] || install -m 0644 -o "$WATCHDOG_UID" -g "$WATCHDOG_UID" \
+  /dev/null /srv/relay-logs/access.log
+chown "$WATCHDOG_UID:$WATCHDOG_UID" /srv/relay-logs/access.log
 
 # The Healthchecks.io ping URL, fetched the same way the SRT passphrase is: from the VM's
 # own managed identity over IMDS, which containers cannot reach. The runner never sees it,
