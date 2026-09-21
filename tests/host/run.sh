@@ -140,6 +140,25 @@ else
   fi
 fi
 
+# --- 4c. relay-apply.sh validates against the image that will actually run --------------
+# `nginx -t` OPENS every access_log, so the validation container needs the telemetry log
+# directory or it fails on a config the real nginx accepts - which is how the first deploy
+# after adding that log would have broken. And validating against whatever nginx:alpine
+# resolves to today, then running a digest-pinned image, tests the wrong binary.
+apply=$(cat "$HOST_DIR/bin/relay-apply.sh")
+if [ "${apply#*--tmpfs /var/log/relay}" != "$apply" ]; then
+  t_ok "relay-apply.sh gives nginx -t somewhere to open the telemetry log"
+else
+  t_fail "relay-apply.sh validates without /var/log/relay; nginx -t will fail on it"
+fi
+directives=$(grep -v '^[[:space:]]*#' "$HOST_DIR/bin/relay-apply.sh")
+if [ "${directives#*NGINX_IMAGE}" != "$directives" ] \
+   && [ "${directives%%nginx:alpine nginx -t*}" = "$directives" ]; then
+  t_ok "relay-apply.sh validates against the compose's pinned image, not a mutable tag"
+else
+  t_fail "relay-apply.sh validates against an unpinned nginx:alpine"
+fi
+
 # --- 5. the manifest covers every committed artifact ------------------------------------
 # A file added to host/ but not to MANIFEST is never checked, and the suite above would
 # still be green - so the set itself is asserted.

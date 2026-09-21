@@ -22,9 +22,23 @@ install -m 0600 "$STAGE/mediamtx.yml.tmpl"  /etc/stream-relay/mediamtx.yml.tmpl
 /usr/local/bin/relay-render.sh
 
 # Validate before restarting anything: a bad nginx.conf takes /meet/ down with the relay.
+#
+# --tmpfs for the telemetry log directory. `nginx -t` does not merely parse: it OPENS every
+# access_log, so a config naming a directory this throwaway container does not have fails
+# validation with "No such file or directory" and blocks the deploy, while the real nginx -
+# which has the relay-logs volume mounted there - would have been perfectly happy.
+#
+# The image is read from the staged compose rather than written here as nginx:alpine. The
+# compose pins by digest precisely because a tag is a mutable pointer; validating against
+# whatever :alpine resolves to today, then running something else, tests the wrong binary.
+NGINX_IMAGE=$(grep -oE 'image: (nginx:[^[:space:]]+)' "$STAGE/docker-compose.yml" \
+  | head -1 | cut -d' ' -f2)
+[ -n "$NGINX_IMAGE" ] || { echo "no nginx image in the staged compose" >&2; exit 1; }
+
 docker run --rm -v "$PROJECT/nginx.conf:/etc/nginx/nginx.conf:ro" \
   -v /srv/hls:/hls:ro -v orfe-web_certbot-certs:/etc/letsencrypt:ro \
-  nginx:alpine nginx -t
+  --tmpfs /var/log/relay \
+  "$NGINX_IMAGE" nginx -t
 
 cd "$PROJECT"
 if command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"; else DC="docker compose"; fi
