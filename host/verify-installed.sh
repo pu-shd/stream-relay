@@ -5,10 +5,15 @@
 # VM fails the next deploy rather than living on as the real configuration while the repo
 # quietly describes something else.
 #
-# Reading the files needs root (the sudoers fragment is 0440), so this is invoked through
-# sudo by install.sh, or run directly as root. Without root it reports UNVERIFIED and exits
-# 2 - "could not check" is neither pass nor fail, and calling it either is how a monitor
-# starts lying.
+# Three of the four artifacts are world-readable and can be checked by anyone; the sudoers
+# fragment is 0440 and needs root. That is deliberate and is not a defect to route around:
+# the file constrains the Actions runner, so the runner has no business reading it, and
+# `sudo`-ing a script out of the runner's own workspace to get at it would hand that runner
+# arbitrary root - a far larger hole than the drift it was meant to detect.
+#
+# So a root-only entry is SKIPPED, named, and counted separately when the caller is not
+# root. Skipped is not passed: the summary says what was not checked and from where it can
+# be. Run as root over the control plane for all four.
 set -eu
 
 HOST_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -19,13 +24,16 @@ HOST_DIR=$(cd "$(dirname "$0")" && pwd)
 # production" has no test.
 DESTROOT=${DESTROOT:-}
 
-# committed path : installed path
+# committed path : installed path : root-only
 MANIFEST="
-bin/relay-render.sh:/usr/local/bin/relay-render.sh
-bin/relay-apply.sh:/usr/local/bin/relay-apply.sh
-etc/sudoers.d-ghrunner-relay:/etc/sudoers.d/ghrunner-relay
-etc/block-imds-from-containers.service:/etc/systemd/system/block-imds-from-containers.service
+bin/relay-render.sh:/usr/local/bin/relay-render.sh:no
+bin/relay-apply.sh:/usr/local/bin/relay-apply.sh:no
+etc/sudoers.d-ghrunner-relay:/etc/sudoers.d/ghrunner-relay:yes
+etc/block-imds-from-containers.service:/etc/systemd/system/block-imds-from-containers.service:no
 "
+
+AM_ROOT=0
+[ "$(id -u)" = "0" ] && AM_ROOT=1
 
 if command -v sha256sum >/dev/null 2>&1; then
   sum() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
@@ -37,10 +45,21 @@ fi
 drift=0
 unreadable=0
 checked=0
+skipped=0
+skipped_names=""
 
 for entry in $MANIFEST; do
   src="$HOST_DIR/${entry%%:*}"
-  dst="$DESTROOT${entry##*:}"
+  rest="${entry#*:}"
+  dst="$DESTROOT${rest%:*}"
+  rootonly="${rest##*:}"
+
+  if [ "$rootonly" = "yes" ] && [ "$AM_ROOT" = "0" ]; then
+    echo "  SKIPPED-NEEDS-ROOT $dst"
+    skipped=$(( skipped + 1 ))
+    skipped_names="$skipped_names $dst"
+    continue
+  fi
 
   if [ ! -f "$src" ]; then
     echo "  MISSING-IN-REPO  $src"
@@ -73,12 +92,18 @@ for entry in $MANIFEST; do
   fi
 done
 
+# Drift is reported before UNVERIFIED: a file that demonstrably differs is a harder fact
+# than one that could not be read, and burying it under "re-run as root" would lose it.
+if [ "$drift" -gt 0 ]; then
+  echo "HOST_LAYER_DRIFT $drift file(s) differ from the repo; run host/install.sh as root" >&2
+  exit 1
+fi
 if [ "$unreadable" -gt 0 ]; then
-  echo "HOST_LAYER_UNVERIFIED $unreadable of $(( checked + unreadable + drift )) unreadable; re-run as root" >&2
+  echo "HOST_LAYER_UNVERIFIED $unreadable file(s) could not be read; re-run as root" >&2
   exit 2
 fi
-if [ "$drift" -gt 0 ]; then
-  echo "HOST_LAYER_DRIFT $drift file(s) differ from the repo; run host/install.sh" >&2
-  exit 1
+if [ "$skipped" -gt 0 ]; then
+  echo "HOST_LAYER_OK $checked file(s) match the repo;$skipped_names needs root (expected off-root)"
+  exit 0
 fi
 echo "HOST_LAYER_OK $checked file(s) match the repo"

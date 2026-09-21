@@ -41,11 +41,28 @@ GOOD="$SANDBOX/good"
 plant "$GOOD"
 if out=$(run_verify "$GOOD"); then
   case "$out" in
-    *HOST_LAYER_OK*4*) t_ok "a faithful install reports OK and says how many it checked" ;;
-    *) t_fail "expected HOST_LAYER_OK with a count, got: $(echo "$out" | tail -1)" ;;
+    *HOST_LAYER_OK*) t_ok "a faithful install reports OK and says how many it checked" ;;
+    *) t_fail "expected HOST_LAYER_OK, got: $(echo "$out" | tail -1)" ;;
   esac
 else
   t_fail "a faithful install was reported as drift: $out"
+fi
+
+# --- 1b. off root, the sudoers file is SKIPPED and SAID SO, not silently passed ---------
+# It is 0440 and it constrains the runner, so the runner cannot read it - by design, not by
+# accident. The risk is the summary reading as a clean bill of health for four files when
+# only three were looked at.
+if [ "$(id -u)" = "0" ]; then
+  t_ok "skipped: running as root, so nothing is root-only (the VM covers this)"
+else
+  out=$(run_verify "$GOOD")
+  if [ "${out#*SKIPPED-NEEDS-ROOT}" != "$out" ] \
+     && [ "${out#*ghrunner-relay}" != "$out" ] \
+     && [ "${out#*HOST_LAYER_OK 3}" != "$out" ]; then
+    t_ok "off root: 3 checked, the sudoers file named as needing root, not counted as passed"
+  else
+    t_fail "expected 'HOST_LAYER_OK 3' and a named SKIPPED-NEEDS-ROOT, got: $out"
+  fi
 fi
 
 # --- 2. a hand-edit on the host is drift, and is NAMED ----------------------------------
@@ -69,9 +86,9 @@ fi
 # --- 3. a missing install is reported as missing, not as a match ------------------------
 ABSENT="$SANDBOX/absent"
 plant "$ABSENT"
-rm "$ABSENT/etc/sudoers.d/ghrunner-relay"
+rm "$ABSENT/etc/systemd/system/block-imds-from-containers.service"
 if out=$(run_verify "$ABSENT"); then
-  t_fail "a missing sudoers fragment passed verification"
+  t_fail "a missing systemd unit passed verification"
 else
   if [ "${out#*NOT-INSTALLED}" != "$out" ]; then
     t_ok "a file that was never installed is reported as NOT-INSTALLED"
@@ -85,7 +102,7 @@ fi
 # starts lying: as a pass it hides drift, as a failure it cries wolf on every non-root run.
 UNREADABLE="$SANDBOX/unreadable"
 plant "$UNREADABLE"
-chmod 000 "$UNREADABLE/etc/sudoers.d/ghrunner-relay"
+chmod 000 "$UNREADABLE/usr/local/bin/relay-render.sh"
 if [ "$(id -u)" = "0" ]; then
   t_ok "skipped: running as root, nothing is unreadable (checked on the VM instead)"
 else
@@ -93,7 +110,7 @@ else
   out=$(run_verify "$UNREADABLE")
   code=$?
   set -e
-  chmod 644 "$UNREADABLE/etc/sudoers.d/ghrunner-relay"
+  chmod 644 "$UNREADABLE/usr/local/bin/relay-render.sh"
   if [ "$code" = "2" ] && [ "${out#*UNVERIFIED}" != "$out" ]; then
     t_ok "an unreadable file exits 2 as UNVERIFIED, distinct from pass and from drift"
   else
@@ -101,11 +118,33 @@ else
   fi
 fi
 
+# --- 4b. drift outranks cannot-check ----------------------------------------------------
+# Both conditions at once must report the one that is a hard fact. Reporting UNVERIFIED
+# here would turn a file that demonstrably differs into "re-run as root" and lose it.
+BOTH="$SANDBOX/both"
+plant "$BOTH"
+echo '# edited live' >> "$BOTH/usr/local/bin/relay-apply.sh"
+chmod 000 "$BOTH/usr/local/bin/relay-render.sh"
+if [ "$(id -u)" = "0" ]; then
+  t_ok "skipped: running as root, nothing is unreadable"
+else
+  set +e
+  out=$(run_verify "$BOTH")
+  code=$?
+  set -e
+  chmod 644 "$BOTH/usr/local/bin/relay-render.sh"
+  if [ "$code" = "1" ] && [ "${out#*HOST_LAYER_DRIFT}" != "$out" ]; then
+    t_ok "drift outranks cannot-check: exit 1, not 2"
+  else
+    t_fail "expected exit 1 HOST_LAYER_DRIFT, got exit $code: $out"
+  fi
+fi
+
 # --- 5. the manifest covers every committed artifact ------------------------------------
 # A file added to host/ but not to MANIFEST is never checked, and the suite above would
 # still be green - so the set itself is asserted.
 committed=$(cd "$HOST_DIR" && find bin etc -type f | sort)
-listed=$(grep -oE '^(bin|etc)/[^:]+' "$HOST_DIR/verify-installed.sh" | sort)
+listed=$(grep -oE '^(bin|etc)/[^:]+:' "$HOST_DIR/verify-installed.sh" | tr -d ':' | sort)
 if [ "$committed" = "$listed" ]; then
   t_ok "every file under host/bin and host/etc is in the manifest"
 else
