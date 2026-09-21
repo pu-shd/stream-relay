@@ -1,268 +1,274 @@
 # stream-relay
 
-SRT ingest, HLS delivery. An encoder publishes SRT to this service; viewers play HLS over
-HTTPS. It exists so a department can run more concurrent streams than its upstream video
-platform allows.
+SRT ingest, HLS delivery. An encoder publishes SRT; viewers play HLS over HTTPS. It exists
+so a department can run more concurrent streams than its upstream video platform allows.
 
-It is department-agnostic: this repo holds no resource names, addresses or channel
-definitions. A deployment lives in its own config repo, which supplies all of those.
-
----
+Department-agnostic: this repo holds no resource names, addresses or channel definitions.
+A deployment lives in its own config repo, which supplies all of those.
 
 ## Architecture
 
 ```
-  encoder                          Azure VM
-┌──────────────┐                   ┌────────────────────────────────────┐
-│  publisher   │ ──SRT/UDP:8890──► │ MediaMTX      remux, no transcode  │
-│  (1 or many) │   encrypted       │   └─ writes HLS to disk            │
-└──────────────┘                   │ nginx :443    serves those files   │
-                                   │ nginx :80     ACME challenge only  │
-                                   │ certbot       renews on a loop     │
-                                   └────────────────┬───────────────────┘
-                                                    │ HTTPS
-                                                 viewers
+  encoder                       Azure VM
+┌────────────┐                  ┌─────────────────────────────────────────┐
+│ publisher  │ ─SRT/UDP:8890──► │ MediaMTX        remux, no transcode     │
+│ (1..n)     │   encrypted      │   └─ writes HLS segments to disk        │
+└────────────┘                  │ nginx :443      serves those files      │
+                                │ nginx :80       ACME challenge only     │
+                                │ certbot         renews on a loop        │
+                                │ watchdog        reports, never restarts │
+                                └────────────┬────────────────────────────┘
+                                             │ HTTPS
+                                          viewers
 ```
 
-No CDN and no object store. For an audience close to the origin there is nothing for a CDN
-to optimise, so nginx serves MediaMTX's `hlsDirectory` directly and the network security
-group is the access control. At CDN-scale viewership that trade stops making sense.
+No CDN, no object store. For an audience close to the origin there is nothing for a CDN to
+optimise, so nginx serves MediaMTX's `hlsDirectory` directly and the NSG is the access
+control. At CDN-scale viewership that trade stops making sense.
 
-MediaMTX's own HLS port is bound but never published. It gates variant playlists on a
-per-viewer session and sends `Cache-Control: private, no-cache`; nginx serving the files
-from disk has neither behaviour.
+MediaMTX's own HLS port is bound but never published: it gates variant playlists per viewer
+and sends `Cache-Control: private, no-cache`. Files on disk have neither behaviour.
 
-**The template adopts a VM rather than creating one.** It references the host, its network
-and its vault as `existing`, so the relay can be added to a machine that already does other
-work. Declaring an existing VM instead would let Azure decide to replace it, and replacement
-destroys its disks. The resource group may be shared, which is why nothing here deletes by
-group.
-
----
+**The template adopts a VM rather than creating one.** Host, network and vault are
+referenced as `existing`, so the relay can join a machine that already does other work.
+Declaring an existing VM instead invites Azure to replace it, and replacement destroys its
+disks. The resource group may be shared, which is why nothing here deletes by group.
 
 ## Repository split
 
 | | |
 | :--- | :--- |
-| **`pu-shd/stream-relay`** (this repo, public) | The engine. Bicep, deploy/verify/teardown scripts, local compose stack, test suites. Department-agnostic: no resource names, no addresses. |
-| **`pu-shd/stream-relay-config`** (private) | The deployment. `<dept>/relay.yml` is the only file anyone edits; everything else in that directory is generated from it. |
+| **`pu-shd/stream-relay`** (this repo, public) | The engine: Bicep, scripts, the host layer, the watchdog image, test suites. |
+| **`pu-shd/stream-relay-config`** (private) | The deployment. `<dept>/relay.yml` is the only file anyone edits. |
 
 `relay.yml` renders `mediamtx.yml.tmpl`, `docker-compose.yml`, `nginx.conf`, `deploy.env`,
 `ingest-urls.env` and `infra.bicepparam`. A test asserts the generated files match the
-source, so drift fails CI rather than surfacing mid-deploy.
-
----
+source, so drift fails CI instead of surfacing mid-deploy.
 
 ## Quick start — local, no cloud, no spend
 
 ```bash
 export SRT_PUBLISH_PASSPHRASE=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 40)
 docker-compose -f docker-compose.local.yml --profile testsrc up -d
-open http://127.0.0.1:8888/news/index.m3u8
 ```
-
-Publish from page-stream instead of the built-in test pattern:
-
-```bash
-node dist/index.js --url https://example.edu/page \
-  --ingest "srt://127.0.0.1:8890?streamid=publish:news&passphrase=$SRT_PUBLISH_PASSPHRASE&pbkeylen=32"
-```
-
----
 
 ## Deploy
 
-GitOps, from the config repo: **Deploy (GitOps)** is `workflow_dispatch` only. `plan` runs
-read-only on a hosted runner and prints the what-if diff *before* the reviewer gate, so the
-approval is informed. Azure jobs authenticate with OIDC; VM-side convergence runs on a
-self-hosted runner on the VM itself.
-
-Or run it directly:
+GitOps from the config repo: **Deploy (GitOps)**, `workflow_dispatch` only. `plan` runs
+read-only and prints the what-if diff *before* the reviewer gate, so the approval is
+informed. Azure jobs use OIDC; VM-side convergence runs on a self-hosted runner on the VM.
 
 ```bash
-scripts/deploy.sh --dry-run          # what-if only
-scripts/deploy.sh                    # converge
-scripts/deploy.sh --from infra       # resume after a failure
-scripts/deploy.sh --list-steps
+scripts/deploy.sh --dry-run      # what-if only
+scripts/deploy.sh                # converge
+scripts/deploy.sh --from infra   # resume after a failure
 ```
 
-Seven steps, resumable, idempotent:
+Seven steps, resumable and idempotent: `preflight`, `register-providers`,
+`resource-group` (confirms, never creates — the group is shared), `passphrase`, `infra`
+(one Bicep deployment: NSG rules and the budget), `configure`, `verify`.
 
-| Step | |
-| :--- | :--- |
-| `preflight` | tooling, login, role, quota |
-| `register-providers` | resource providers |
-| `resource-group` | confirms it exists — never creates it, the group is shared |
-| `passphrase` | ensures the SRT passphrase is in Key Vault |
-| `infra` | one Bicep deployment: NSG rules and the budget |
-| `configure` | renders the relay config on the VM and brings the stack up |
-| `verify` | asserts the deployment end to end |
-
-`--with-role-assignments` is the one-time human bootstrap; it needs Owner or User Access
+`--with-role-assignments` is the one-time human bootstrap and needs Owner or User Access
 Administrator. Every other run, CI included, never touches RBAC.
 
----
+| Script | |
+| :--- | :--- |
+| `bootstrap.sh` | interactive first run, including role assignments CI may not create |
+| `deploy.sh` | non-interactive, idempotent, CI-callable |
+| `verify.sh` | one-shot gate: did this deployment come up correctly |
+| `update.sh` | roll new config without touching infrastructure |
+| `restrict.sh` / `allow-all.sh` | kill switch and break glass for the viewer allowlist |
+| `teardown.sh` | remove the relay's own resources |
 
-## Scripts
+## Host layer
+
+`host/` holds the privileged artifacts that run as root on the VM: `relay-secret.sh` (one
+Key Vault fetch over IMDS), `relay-render.sh`, `relay-apply.sh`, the sudoers fragment, and
+the systemd unit that blocks IMDS from container networks.
+
+They ran in production for months existing in no repository. They are committed verbatim,
+and `host/verify-installed.sh` compares the installed copies by SHA-256 — the converge job
+runs it before anything privileged, so a hand-edit on the VM fails the next deploy rather
+than surviving indefinitely. It reports three outcomes, not two: match, drift, and
+cannot-check.
+
+`host/install.sh` is deliberately **not** in the sudoers grant. Updating the host layer is
+an operator action over the control plane:
+
+```bash
+az vm run-command invoke -g <rg> -n <vm> --command-id RunShellScript \
+  --scripts 'cd /opt/stream-relay-src && sudo host/install.sh'
+```
+
+The runner still has exactly two paths to root; `relay-secret.sh` is a third script called
+*by* those two rather than a third grant.
+
+## Monitoring
+
+Two halves, answering different questions.
+
+**`docker/watchdog/`** runs on the relay every `interval_seconds`. It reads MediaMTX's
+Prometheus metrics (never the control API — `metrics` is read-only, while `api` would let
+its holder rewrite the relay's config) and the nginx access log, and pings a
+Healthchecks.io dead-man's switch. If the VM is off the pings stop, and silence raises the
+alarm.
+
+It reports and never restarts anything. Three severities, kept apart:
 
 | | |
 | :--- | :--- |
-| `bootstrap.sh` | interactive first run, including the role assignments CI may not create |
-| `deploy.sh` | non-interactive, idempotent, CI-callable |
-| `verify.sh` | asserts the deployed relay actually serves |
-| `update.sh` | roll new config without touching infrastructure |
-| `restrict.sh` | kill switch — narrow the viewer allowlist, or close it entirely |
-| `allow-all.sh` | break glass — reopen after `restrict.sh` |
-| `teardown.sh` | remove the relay's own resources (see below) |
+| **problem** | an expected publisher absent or **not advancing**; nginx not serving; certificate near expiry |
+| **warn** | SRT loss over threshold, certificate three weeks out — rides the *success* ping |
+| **fault** | the monitor could not see. Not healthy, not broken; its own thing |
 
----
+Rising byte counters, not non-zero ones: a wedged publisher leaves `ready: true` and a
+frozen counter, which one reading cannot distinguish from health.
+
+The certificate is read off the **TLS handshake**, not the file — a renewal nginx has not
+reloaded leaves the old certificate on the wire while a fresh one sits on disk.
+
+**The `Watchdog` workflow** in the config repo renders the snapshot into a step summary on
+a schedule. It cannot report that the VM is off — it would queue against an offline runner
+— which is why the dead-man's switch exists alongside it.
+
+Viewer counts come from the nginx log and nowhere else: nginx serves the segments, so
+MediaMTX's `readers` is permanently 0. Client addresses are retained only for device
+classes declaring `retain_address`; everyone else is counted and discarded.
 
 ## Access control
 
-The NSG is the boundary. There is no WAF and no CDN in front of it.
+The NSG is the boundary. No WAF, no CDN.
 
 | Port | Source |
 | :--- | :--- |
 | `8890/udp` | the publisher's network — SRT wire encryption is the publish credential |
-| `443/tcp` | the viewer networks the config allows — nothing else reaches the HLS |
+| `443/tcp` | the viewer networks the config allows |
 | `80/tcp` | the internet, serving `/.well-known/acme-challenge` and nothing else |
 | `22` | **no rule** |
 
-Port 80 is open because Let's Encrypt validates from undisclosed, rotating addresses, so the
-rule cannot be narrowed to them. nginx 404s every other path on that port, so what is
-exposed is a directory of ACME tokens.
+Port 80 is open because Let's Encrypt validates from undisclosed, rotating addresses.
+nginx 404s every other path there, so what is exposed is a directory of ACME tokens.
 
-There is no inbound administrative path. Administration is `az vm run-command` over the
-Azure control plane, which is RBAC-gated and audited.
+There is no inbound administrative path; administration is `az vm run-command`, RBAC-gated
+and audited.
 
-**Allowlisting a VPN needs the egress ranges, not the gateway addresses.** Cloud VPN
-services commonly source-NAT clients from a pool that is not adjacent to the gateway a
-client connected to, so a list built from resolved gateway addresses admits the gateways and
-blocks every client behind them. Test from a real VPN connection before trusting one.
-
----
+**Allowlisting a VPN needs its egress ranges, not its gateway addresses.** Cloud VPN
+services commonly source-NAT clients from a pool not adjacent to the gateway they connected
+to, so a list built from resolved gateways admits the gateways and blocks every client
+behind them. Test from a real connection before trusting one.
 
 ## Identities
 
-Two, least privilege each.
-
 | | |
 | :--- | :--- |
-| **CI** — federated to GitHub Actions via OIDC | Network Contributor and Cost Management Contributor on the resource group, Key Vault Secrets Officer on the vault. No stored credential. |
-| **VM** — SystemAssigned | reads one Key Vault secret. Nothing else. |
+| **CI**, federated via OIDC | Network Contributor + Cost Management Contributor on the group, Key Vault Secrets Officer on the vault. No stored credential. |
+| **VM**, SystemAssigned | reads one Key Vault secret. Nothing else. |
 
-Not Contributor: the resource group is shared, so Contributor would permit deleting the
-machine the relay runs on.
-
-CI cannot create role assignments. `deployRoleAssignments` defaults to `false`, and a
-principal that can grant roles can grant itself any role in scope.
+Not Contributor: the group is shared, and Contributor would permit deleting the machine the
+relay runs on. CI cannot create role assignments — `deployRoleAssignments` defaults to
+`false`, and a principal that can grant roles can grant itself any role in scope.
 
 OIDC subjects carry GitHub's immutable org and repo IDs
-(`repo:org@123/repo@456:ref:refs/heads/main`), which is what stops a renamed or transferred
-repository inheriting the trust.
-
----
+(`repo:org@123/repo@456:ref:refs/heads/main`), so a renamed or transferred repository does
+not inherit the trust.
 
 ## Accepted risks
 
-**A self-hosted runner is root on its host.** The runner's user is in the `docker` group,
-which is root-equivalent — `docker run -v /:/host` yields the whole filesystem — so the
-narrow sudoers rule granting it two scripts bounds nothing. Anyone who can land a workflow
-on that runner can take the host.
+**A self-hosted runner is root on its host.** Its user is in the `docker` group, which is
+root-equivalent, so the narrow sudoers rule bounds nothing. Accepted rather than fixed — it
+is a property of self-hosted runners generally. What bounds it instead: only
+`workflow_dispatch` workflows reach the runner, all gated on a `production` environment
+with a required reviewer; no `pull_request` or `push` trigger targets it; actions are
+pinned to commit SHAs and images to digests.
 
-This is accepted rather than fixed, and it is a property of self-hosted runners generally,
-not of this design. What bounds it instead:
+If the host later runs something that must not share a blast radius with CI, move the
+runner to a dedicated machine rather than de-privileging it in place.
 
-- Only `workflow_dispatch` workflows reach the runner, and both are gated on a `production`
-  environment with a required reviewer.
-- No `pull_request` or `push` trigger targets it, so untrusted branch code never lands there.
-- Actions are pinned to commit SHAs and images to digests, closing the path where a moved
-  upstream tag becomes code execution.
+**IMDS is blocked for container networks.** Otherwise any container could mint a token for
+the VM's identity and read the passphrase, defeating the design where the runner never sees
+it. A `DOCKER-USER` rule drops traffic to `169.254.169.254` from container networks while
+leaving the host's own path working — which is how the config is rendered. Reapplied at
+boot by a systemd unit, because `DOCKER-USER` exists only once dockerd has started.
 
-If the host later runs something that must not share a blast radius with CI, move the runner
-to a dedicated machine rather than trying to de-privilege it in place.
-
-**IMDS is blocked for container networks.** Without that, any container on the host can mint
-a token for the VM's managed identity and read the Key Vault secret — which defeats the
-design where the runner never sees the passphrase. A `DOCKER-USER` rule drops traffic to
-`169.254.169.254` from container networks while leaving the host's own path working, since
-that is how the config is rendered. It is reapplied at boot by a systemd unit, because
-`DOCKER-USER` only exists once dockerd has started.
+**One passphrase, server-wide.** MediaMTX supports a distinct passphrase per path, but this
+renders the same value into all of them, so a rotation is an N-channel outage and a leak
+costs the estate rather than one channel. Worth splitting once a publisher appears that you
+do not control.
 
 ## TLS
 
 certbot renews on a loop and nginx reloads on another, both as containers. A one-shot
-`certbot certonly` issues a certificate that expires ninety days later with nobody watching.
+`certbot certonly` issues a certificate that expires ninety days later with nobody
+watching — which is exactly what the adopted deployment had done.
 
-The certificate must cover a real hostname. `*.cloudapp.azure.com` is absent from the Public
-Suffix List, so Let's Encrypt counts it against `azure.com` — a rate limit shared with every
-Azure tenant — and can never issue for the derived name. Enabling TLS without a `domain` is
-a config error.
-
----
+The certificate must cover a real hostname. `*.cloudapp.azure.com` is absent from the
+Public Suffix List, so Let's Encrypt counts it against `azure.com` and can never issue for
+the derived name. Enabling TLS without a `domain` is a config error.
 
 ## Cost
 
-Egress dominates, and it scales with **viewers**, not channels:
+Egress dominates and scales with **viewers**, not channels:
 
 ```
 monthly egress GB ≈ viewers × bitrate_Mbps × 3600 × 24 × 30 / 8 / 1000
 ```
 
-Egress is typically the larger line by several times. Run `tools/render-relay.py <dept>
---size` in the config repo for a projection from the actual channel count, bitrate and
-expected viewers.
+Bitrate is the highest-leverage lever, and the relay pays for exactly what a producer sends
+— tier 0 is passthrough, no re-encode. VM size is not a lever: remuxing is an I/O job, and
+a two-vCPU host carries eight simultaneous 1080p channels at ~13% of one core.
 
-Bitrate is the highest-leverage lever. VM size is not: remuxing is an I/O job, and a
-two-vCPU host carries eight simultaneous 1080p channels at around 13% of one core, so the
-sizing model errs generous by design.
-
-A budget with forecast alerts is provisioned by the deployment. Forecast matters — once
-actual spend crosses a ceiling the money is already gone.
-
----
+`tools/render-relay.py <dept> --size` in the config repo projects from the real channel
+count, bitrate and expected viewers. A budget with **forecast** alerts is provisioned by
+the deployment; forecast matters, because once actual spend crosses a ceiling the money is
+already gone.
 
 ## Testing
 
 ```bash
-tests/mock-az/run.sh                 # 33 assertions, offline, no cloud
-tests/integration/test-live-relay.sh # against a real deployment
+tests/mock-az/run.sh                      # 37 assertions, offline, no cloud
+tests/host/run.sh                         # the host layer's drift logic
+python3 tests/watchdog/test_watchdog.py   # 27 tests, stdlib, no network
+tests/integration/test-live-relay.sh      # against a real deployment
 ```
 
-The offline suite proves the step machine is idempotent, resumable and state-free, that
-preflight fails closed, that the passphrase never reaches an `az` argv, and that teardown
-deletes nothing it does not own.
-
----
+The offline suites prove the step machine is idempotent, resumable and state-free; that
+preflight fails closed; that the passphrase never reaches an `az` argv; that teardown
+deletes nothing it does not own and refuses while channels are live; and that the watchdog
+tells wedged from healthy from cannot-see.
 
 ## Teardown
 
 ```bash
-scripts/teardown.sh --keep-ip --keep-registry
+scripts/teardown.sh --keep-ip --keep-registry     # selective: the normal call
+scripts/teardown.sh --dry-run                     # show what would go
 ```
 
-Removes the SRT ingest rule, the budget, the CI identity and the relay container. Leaves the
-VM, its NIC, vnet, NSG, public IP, Key Vault and disks, all of which are adopted — and
-leaves the `:443` and `:80` rules, since other services on a shared host may serve on one
-and renew certificates over the other.
+Removes the SRT ingest rule, the budget, the CI identity, and the relay and watchdog
+containers. Leaves the VM, NIC, vnet, NSG, public IP, Key Vault and disks — all adopted —
+and leaves `:443` and `:80`, since other services on a shared host may serve on one and
+renew certificates over the other.
 
-Deleting the resource group is refused when `SHARED_RESOURCE_GROUP` is not exactly `false`,
+**Refused while any channel declares `publishing: true`.** Tearing down takes live channels
+off the air and the producers will not notice: SRT backoff reconnects forever rather than
+exiting, so every container stays healthy while the displays hold their last frame.
+`--abandon-channels` overrides it. The watchdog is stopped *before* the relay, so planned
+work does not page.
+
+Deleting the resource group is refused unless `SHARED_RESOURCE_GROUP` is exactly `false`,
 and fails closed when the flag is absent.
-
----
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | :--- | :--- |
-| Publisher connects, then drops | Wrong passphrase. SRT wire encryption is the credential — `?passphrase=…&pbkeylen=32`, not the streamid's `user:pass` field. |
+| Publisher connects, then drops | Wrong passphrase. SRT wire encryption is the credential — `?passphrase=…&pbkeylen=32`, not the streamid's `user:pass`. |
 | Playlist stops advancing, ingest looks healthy | `hlsAlwaysRemux` is off. nginx reads the directory rather than connecting as a client, so MediaMTX sees no readers and closes the muxer. |
+| Container healthy, nothing on screen | The publisher is not publishing. `docker exec stream-relay wget -qO- http://127.0.0.1:9997/v3/paths/list` — the API answers only from inside the container. |
 | Viewers blocked, allowlist looks right | VPN egress ranges. See Access control. |
 | Every display dark at once | The `443` allowlist. Check a viewer's egress address against the configured ranges. |
+| `401` reading metrics from another container | Expected. MediaMTX admits api/metrics from its own loopback; the watchdog has an explicit `/32` grant for `metrics` only. |
+| Watchdog up but writing no snapshot | Ownership. It runs unprivileged, so `/srv/relay-logs` and `/srv/relay-status` must belong to its uid. |
 | `BCP091` on deploy | The engine and config repos must be siblings; `infra.bicepparam` names its template relatively. |
-| Container healthy, nothing on screen | The publisher is not publishing. `docker exec stream-relay wget -qO- http://127.0.0.1:9997/v3/paths/list` — the API answers only from inside the container. |
-
----
 
 ## License
 
