@@ -122,6 +122,19 @@ jobs:
         # the only thing keeping host/ honest, so it is run rather than assumed.
         run: tests/host/run.sh
 
+  watchdog:
+    name: Watchdog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Run the offline suite
+        # stdlib unittest, no pytest and no network. The watchdog decides whether anyone
+        # is told the wall is dark, so it is run against synthetic inputs rather than
+        # grepped.
+        run: python3 tests/watchdog/test_watchdog.py
+      - name: The image builds
+        run: docker build -q -t relay-watchdog:ci docker/watchdog
+
   mock-az:
     name: Deployment scripts (mock az)
     runs-on: ubuntu-latest

@@ -26,6 +26,7 @@ DESTROOT=${DESTROOT:-}
 
 # committed path : installed path : root-only
 MANIFEST="
+bin/relay-secret.sh:/usr/local/bin/relay-secret.sh:no
 bin/relay-render.sh:/usr/local/bin/relay-render.sh:no
 bin/relay-apply.sh:/usr/local/bin/relay-apply.sh:no
 etc/sudoers.d-ghrunner-relay:/etc/sudoers.d/ghrunner-relay:yes

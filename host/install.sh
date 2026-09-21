@@ -16,8 +16,10 @@ install -d -m 0755 /usr/local/bin
 install -d -m 0700 /etc/stream-relay
 install -d -m 0755 /opt/stream-relay-staging
 
-# --- the two scripts the runner may call ------------------------------------------------
-for s in relay-render.sh relay-apply.sh; do
+# --- the scripts -------------------------------------------------------------------------
+# Three are installed; only two are in the sudoers grant. relay-secret.sh is called BY the
+# other two, which already run as root, so the runner gains no new path to root from it.
+for s in relay-secret.sh relay-render.sh relay-apply.sh; do
   install -m 0755 -o root -g root "$HOST_DIR/bin/$s" "/usr/local/bin/$s"
   echo "  installed /usr/local/bin/$s"
 done

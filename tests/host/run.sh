@@ -23,11 +23,12 @@ trap 'rm -rf "$SANDBOX"' EXIT
 plant() {
   root=$1
   mkdir -p "$root/usr/local/bin" "$root/etc/sudoers.d" "$root/etc/systemd/system"
-  cp "$HOST_DIR/bin/relay-render.sh" "$root/usr/local/bin/relay-render.sh"
-  cp "$HOST_DIR/bin/relay-apply.sh"  "$root/usr/local/bin/relay-apply.sh"
-  cp "$HOST_DIR/etc/sudoers.d-ghrunner-relay" "$root/etc/sudoers.d/ghrunner-relay"
-  cp "$HOST_DIR/etc/block-imds-from-containers.service" \
-     "$root/etc/systemd/system/block-imds-from-containers.service"
+  # Driven off the manifest rather than a hand-written list, so adding a file to host/bin
+  # cannot leave the fixture silently behind the thing it is meant to exercise.
+  grep -oE '^(bin|etc)/[^:]+:[^:]+' "$HOST_DIR/verify-installed.sh" | while IFS=: read -r src dst; do
+    mkdir -p "$root$(dirname "$dst")"
+    cp "$HOST_DIR/$src" "$root$dst"
+  done
 }
 
 run_verify() {
@@ -56,12 +57,17 @@ if [ "$(id -u)" = "0" ]; then
   t_ok "skipped: running as root, so nothing is root-only (the VM covers this)"
 else
   out=$(run_verify "$GOOD")
+  # Derived from the manifest, not hardcoded: a literal count here goes stale the moment
+  # a file is added, and the failure reads as a regression rather than a stale test.
+  total=$(grep -cE '^(bin|etc)/[^:]+:' "$HOST_DIR/verify-installed.sh")
+  rootonly=$(grep -cE '^(bin|etc)/[^:]+:[^:]+:yes$' "$HOST_DIR/verify-installed.sh")
+  want=$(( total - rootonly ))
   if [ "${out#*SKIPPED-NEEDS-ROOT}" != "$out" ] \
      && [ "${out#*ghrunner-relay}" != "$out" ] \
-     && [ "${out#*HOST_LAYER_OK 3}" != "$out" ]; then
-    t_ok "off root: 3 checked, the sudoers file named as needing root, not counted as passed"
+     && [ "${out#*HOST_LAYER_OK $want}" != "$out" ]; then
+    t_ok "off root: $want checked, the root-only file named, not counted as passed"
   else
-    t_fail "expected 'HOST_LAYER_OK 3' and a named SKIPPED-NEEDS-ROOT, got: $out"
+    t_fail "expected 'HOST_LAYER_OK $want' and a named SKIPPED-NEEDS-ROOT, got: $out"
   fi
 fi
 
