@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # verify.sh — assert the deployed relay actually works.
 #
-# Runs against the FRONT DOOR hostname, not the VM, because most of what can go wrong here
-# is in the CDN layer. Two assertions exist because the failure they catch is expensive
-# rather than merely broken:
+# Runs against the public hostname from wherever it is invoked. There is no CDN: nginx on
+# the VM serves MediaMTX's hlsDirectory as ordinary static files, so everything here is a
+# property of that host.
 #
-#   * CACHE HIT on a repeated manifest request. MediaMTX appends '?session=<uuid>' per
-#     viewer, so without the Ignore-Specified-Query-Strings rule every viewer is a distinct
-#     cache key, the hit rate collapses, and origin egress roughly doubles the bill. This
-#     is invisible in the portal and only shows up on an invoice.
+# ONE-SHOT, and that is its limit. It answers "did this deployment come up correctly",
+# which is a different question from "is the relay still working an hour from now" - a
+# publisher can wedge with every byte of this still passing. The watchdog holds state
+# between passes and answers the second question; this one is a gate, not a monitor.
 #
-#   * HOSTNAME STABILITY across teardown/redeploy (--check-hostname-stability). If Front
-#     Door's pseudorandom hash changed on redeploy, every Apple TV's vlc.xml would break at
-#     the exact moment the fallback was being activated.
+# Vantage point matters. Delivery is gated to the campus and VPN ranges, so a
+# GitHub-hosted runner cannot fetch a manifest however healthy the relay is. That is the
+# allowlist working, not a defect, and those checks are skipped with a reason rather than
+# counted as unverified - which would make a correct deployment report amber forever.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,10 +111,16 @@ fi
 
 # --- 3. per-path manifests --------------------------------------------------------------
 step_header 3 6 "Channel manifests"
+# ${HLS} is load-bearing and was missing. nginx serves HLS under /hls/ only and 404s
+# everything else, so `https://$HOST/$p/index.m3u8` could never match a manifest: this
+# step reported "no publisher" for every path, on every run, including runs where a
+# channel was demonstrably live. Read from deploy.env rather than written here so it
+# cannot drift from the nginx config that defines it.
+HLS="${RELAY_HTTP_PATH:-/hls/}"
 IFS=',' read -ra paths <<< "${RELAY_PATHS:-}"
 served=0
 for p in "${paths[@]}"; do
-  body=$(curl -sL --max-time 20 "https://$HOST/$p/index.m3u8" || true)
+  body=$(curl -sL --max-time 20 "https://$HOST${HLS}$p/index.m3u8" || true)
   if grep -q '#EXTM3U' <<<"$body"; then
     check_ok "$p serves a manifest"
     served=$(( served + 1 ))
@@ -137,77 +144,57 @@ else
   unverified=$(( unverified + 1 ))
 fi
 
-# --- 4. the cache rule ------------------------------------------------------------------
-step_header 4 6 "Cache behaviour (the expensive one)"
-# SEGMENTS are what this asserts, not manifests.
+# --- 4. cache headers -------------------------------------------------------------------
+step_header 4 6 "Cache headers"
+# This step used to assert X-Cache: HIT and that a ?session query string did not split the
+# cache key. Both were Front Door properties, and Front Door is gone - nginx serves
+# MediaMTX's hlsDirectory as ordinary files. Those assertions could never pass again, and
+# they never failed either, because step 3's broken URL meant FIRST_SERVED was never set
+# and the whole block skipped. Two dead checks hidden behind a third bug.
 #
-# Manifests are rewritten every segment duration and carry a ~2s TTL, so they are
-# near-uncacheable BY DESIGN and a miss on them is expected. Segments are immutable once
-# written and are ~99% of the bytes, so segment cache behaviour is what decides whether the
-# activated bill is ~$420/mo of egress or roughly double that. Asserting the manifest
-# instead would fail permanently while telling you nothing about cost.
+# What still matters without a CDN is the policy nginx sets, and it matters for
+# correctness rather than cost: a cached playlist pins a player to segments that have
+# already been deleted, which is a stall on the wall with everything else green.
 if [ -n "${FIRST_SERVED:-}" ]; then
-  url="https://$HOST/$FIRST_SERVED/index.m3u8"
+  url="https://$HOST${HLS}$FIRST_SERVED/index.m3u8"
 
-  # The origin must not mark content uncacheable. MediaMTX's own HLS server sent
-  # "private, no-cache" and gated playlists behind a per-viewer session, which no
-  # rules-engine override can undo - that is why delivery moved to static files.
   mhdrs=$(curl -s -D - -o /dev/null -L --max-time 20 "$url" || true)
-  if grep -qiE 'cache-control:.*(private|no-store)' <<<"$mhdrs"; then
-    check_fail "origin marks content UNCACHEABLE — Front Door cannot cache it, so egress roughly doubles"
+  if grep -qiE 'cache-control:.*(no-cache|no-store)' <<<"$mhdrs"; then
+    check_ok "playlist is not cacheable ($(grep -i '^cache-control:' <<<"$mhdrs" | tr -d '\r' | head -1))"
   else
-    check_ok "origin allows caching ($(grep -i '^cache-control:' <<<"$mhdrs" | tr -d '\r' | head -1))"
+    check_fail "playlist is cacheable: $(grep -i '^cache-control:' <<<"$mhdrs" | tr -d '\r' | head -1 || echo 'no Cache-Control') — a stale one points players at deleted segments"
   fi
 
   variant=$(curl -sL --max-time 20 "$url" | grep -v '^#' | grep 'm3u8' | head -1 || true)
   segment=""
-  [ -n "$variant" ] && segment=$(curl -sL --max-time 20 "https://$HOST/$FIRST_SERVED/$variant" \
+  [ -n "$variant" ] && segment=$(curl -sL --max-time 20 "https://$HOST${HLS}$FIRST_SERVED/$variant" \
     | grep -v '^#' | grep -E '\.ts|\.m4s|\.mp4' | head -1 || true)
 
   if [ -n "$segment" ]; then
-    segurl="https://$HOST/$FIRST_SERVED/$segment"
-    curl -s -o /dev/null -L --max-time 25 "$segurl" || true   # prime the edge
-    sleep 3
-    shdrs=$(curl -s -D - -o /dev/null -L --max-time 25 "$segurl" || true)
-    xc=$(grep -i '^x-cache:' <<<"$shdrs" | tr -d '\r' | head -1)
-    if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$shdrs"; then
-      check_ok "SEGMENT served from the edge cache (${xc:-hit}) — origin egress collapses to ~1 fill per POP"
+    shdrs=$(curl -s -D - -o /dev/null -L --max-time 25 "https://$HOST${HLS}$FIRST_SERVED/$segment" || true)
+    if grep -qiE 'cache-control:.*max-age=[1-9]' <<<"$shdrs"; then
+      check_ok "segments are cacheable ($(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1))"
     else
-      check_fail "segment was not a cache hit (${xc:-no X-Cache}); every viewer byte would also cost an origin byte"
-    fi
-
-    if grep -qiE 'cache-control:.*max-age=([6-9][0-9]|[1-9][0-9]{2,})' <<<"$shdrs"; then
-      check_ok "segment TTL is long enough to be worth caching ($(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1))"
-    else
-      check_fail "segment TTL too short to cache usefully: $(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1)"
-    fi
-
-    # A per-viewer query string must not split the cache key.
-    curl -s -o /dev/null -L --max-time 25 "${segurl}?session=aaaa" || true
-    s2=$(curl -s -D - -o /dev/null -L --max-time 25 "${segurl}?session=bbbb" || true)
-    if grep -qiE 'x-cache:.*(HIT|TCP_HIT|PARTIAL_HIT)' <<<"$s2"; then
-      check_ok "differing ?session values share one cache key"
-    else
-      check_fail "?session split the cache key — IgnoreSpecifiedQueryStrings is not in effect"
+      check_fail "segments carry no usable max-age: $(grep -i '^cache-control:' <<<"$shdrs" | tr -d '\r' | head -1 || echo 'no Cache-Control')"
     fi
   else
-    skipped "no segment listed yet (stream may still be filling)"
+    skipped "no segment listed yet (the stream may still be filling)"
     if [ "${REQUIRE_LIVE:-0}" = "1" ]; then
-      check_fail "no segment available to test caching while --require-live was set"
+      check_fail "no segment available while --require-live was set"
     else
-      unverified=$(( unverified + 3 ))
+      unverified=$(( unverified + 1 ))
     fi
   fi
 else
-  skipped "no live channel, so cache behaviour cannot be asserted"
+  skipped "no live channel, so cache headers cannot be asserted"
   if [ "${REQUIRE_LIVE:-0}" = "1" ]; then
-    check_fail "cache behaviour unverified while --require-live was set"
+    check_fail "cache headers unverified while --require-live was set"
   else
     if [ "$VIEWER_ACCESS" = "0" ]; then
-      skipped "cache behaviour needs viewer access; this host is outside the allowlist"
+      skipped "cache headers need viewer access; this host is outside the allowlist"
     else
-      warn "cache correctness is UNVERIFIED — re-run with a publisher active"
-      unverified=$(( unverified + 3 ))
+      warn "cache headers are UNVERIFIED — re-run with a publisher active"
+      unverified=$(( unverified + 1 ))
     fi
   fi
 fi
