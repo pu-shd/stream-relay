@@ -1,0 +1,1 @@
+ghrunner ALL=(root) NOPASSWD: /usr/local/bin/relay-render.sh, /usr/local/bin/relay-apply.sh

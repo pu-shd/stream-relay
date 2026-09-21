@@ -1,0 +1,12 @@
+[Unit]
+Description=Block IMDS (169.254.169.254) from container networks
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -d 169.254.169.254/32 -j DROP 2>/dev/null || iptables -I DOCKER-USER 1 -d 169.254.169.254/32 -j DROP'
+
+[Install]
+WantedBy=multi-user.target
