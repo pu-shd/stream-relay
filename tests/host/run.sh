@@ -171,10 +171,19 @@ fi
 # "successfully" while the relay kept serving the config it booted with - green deploy,
 # green healthcheck, and a publisher rejected for a path that did not exist. The container
 # was 26 hours older than the config it was supposedly running.
-if grep -q 'before=\$(sha256sum' "$HOST_DIR/bin/relay-apply.sh"; then
-  t_ok "relay-apply.sh hashes the rendered config either side of rendering"
+# STATE, not events. The first attempt compared hashes either side of relay-render.sh,
+# which sees nothing when a PREVIOUS run updated the config and failed to restart - the
+# drift outlives the run that caused it, and that is exactly how it was found.
+if grep -q 'State.StartedAt' "$HOST_DIR/bin/relay-apply.sh" \
+   && grep -q 'stat -c %Y' "$HOST_DIR/bin/relay-apply.sh"; then
+  t_ok "relay-apply.sh compares the config's mtime against the container's start time"
 else
-  t_fail "relay-apply.sh cannot tell whether the config changed"
+  t_fail "relay-apply.sh cannot tell whether the RUNNING relay predates its config"
+fi
+if grep -q 'before=\$(sha256sum' "$HOST_DIR/bin/relay-apply.sh"; then
+  t_fail "relay-apply.sh compares hashes across the run; that misses pre-existing drift"
+else
+  t_ok "it does not rely on detecting a change within one run"
 fi
 if [ "${apply#*docker restart stream-relay}" != "$apply" ]; then
   t_ok "relay-apply.sh restarts the relay when the config changed"
@@ -183,8 +192,8 @@ else
 fi
 # Conditional, not unconditional: every no-op converge would otherwise drop every
 # publisher, and those run far more often than real changes.
-if grep -q 'if \[ "\$before" != "\$after" \]' "$HOST_DIR/bin/relay-apply.sh"; then
-  t_ok "the restart is conditional on the config actually changing"
+if grep -q 'cfg_epoch" -gt "\$started_epoch' "$HOST_DIR/bin/relay-apply.sh"; then
+  t_ok "the restart is conditional, so a no-op converge drops no publishers"
 else
   t_fail "the relay restarts on every converge, dropping publishers needlessly"
 fi

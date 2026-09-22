@@ -65,16 +65,8 @@ fi
 
 # Renders mediamtx.yml from the template plus the Key Vault passphrase.
 #
-# The hash is taken either side, because a CONFIG-ONLY change never reaches MediaMTX on
-# its own: mediamtx.yml is a bind-mounted file, and `compose up -d` recreates a container
-# only when its SERVICE DEFINITION changes. Adding a path to the template therefore
-# converged "successfully" while the relay kept serving the config it booted with -
-# green deploy, green healthcheck, and a publisher rejected because its path did not
-# exist. Found with a container 26 hours older than the config it was supposedly running.
 CFG=/etc/stream-relay/mediamtx.yml
-before=$(sha256sum "$CFG" 2>/dev/null | cut -d' ' -f1 || true)
 /usr/local/bin/relay-render.sh
-after=$(sha256sum "$CFG" 2>/dev/null | cut -d' ' -f1 || true)
 
 # Validate before restarting anything: a bad nginx.conf takes /meet/ down with the relay.
 #
@@ -101,11 +93,30 @@ if command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"; else DC=
 # `build:`, so this is a no-op for them.
 $DC up -d --build --remove-orphans
 
-# Restart only when the config actually changed. Unconditional would drop every
-# publisher on every deploy, including the no-op converges that run far more often.
-if [ "$before" != "$after" ]; then
-  echo "mediamtx.yml changed; restarting the relay to load it"
-  docker restart stream-relay >/dev/null
+# IS THE RUNNING RELAY OLDER THAN ITS CONFIG?
+#
+# A config-only change never reaches MediaMTX on its own: mediamtx.yml is a bind-mounted
+# file, and `compose up -d` recreates a container only when its SERVICE DEFINITION
+# changes. Adding a path rendered, staged and installed correctly while the relay kept
+# serving what it booted with - green deploy, green healthcheck, and a publisher rejected
+# for a path that did not exist.
+#
+# The obvious check is whether this run changed the file, and it is WRONG: the first
+# attempt at this fix compared hashes either side of relay-render.sh, which sees nothing
+# when a PREVIOUS run already updated the config and failed to restart. The drift
+# outlives the run that caused it.
+#
+# So compare state, not events: if the config is newer than the process, the process
+# cannot be running it. That is true whenever it is true, regardless of which run left it
+# that way, and it is naturally a no-op once they agree.
+started=$(docker inspect stream-relay --format '{{.State.StartedAt}}' 2>/dev/null || echo "")
+if [ -n "$started" ] && [ -f "$CFG" ]; then
+  started_epoch=$(date -d "$started" +%s 2>/dev/null || echo 0)
+  cfg_epoch=$(stat -c %Y "$CFG" 2>/dev/null || echo 0)
+  if [ "$cfg_epoch" -gt "$started_epoch" ]; then
+    echo "mediamtx.yml is newer than the running relay; restarting to load it"
+    docker restart stream-relay >/dev/null
+  fi
 fi
 
 for _ in $(seq 1 24); do
