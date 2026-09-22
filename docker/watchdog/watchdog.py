@@ -30,7 +30,7 @@ THREE SEVERITIES, and the distinction is the whole point:
 
   problem  -> /fail. An expected publisher is absent or has stopped advancing; nginx is
               not serving; the certificate expires within cert_days_fail.
-  warn     -> rides the SUCCESS ping body. SRT loss over threshold, certificate nearing
+  warn     -> rides the SUCCESS ping body. Errored frames over threshold, cert nearing
               expiry. Being degraded is not being broken, and a warning that flips the
               check to down makes an outage and a busy afternoon indistinguishable -
               after which everyone ignores both.
@@ -77,7 +77,12 @@ EXPECTED_UNSET = _EXPECTED_RAW is None
 EXPECTED = [p for p in (_EXPECTED_RAW or "").split(",") if p]
 ALL_PATHS = [p for p in os.environ.get("RELAY_PATHS", "").split(",") if p]
 
-SRT_LOSS_WARN = float(os.environ.get("SRT_LOSS_PERCENT_WARN", "3.0"))
+# Errored frames PER PASS, not cumulatively - a lifetime counter warns forever after one
+# blip. SRT loss percent used to be the trigger and was the wrong metric: it tracks
+# bitrate rather than damage, its drop counter matches its retransmit counter to the
+# packet, and raising SRT latency tenfold moved it by noise while frames_in_error stayed
+# at 0 and the displays stayed correct. Loss is still recorded; it no longer pages.
+FRAMES_IN_ERROR_WARN = int(os.environ.get("FRAMES_IN_ERROR_WARN", "10"))
 CERT_DAYS_WARN = int(os.environ.get("CERT_DAYS_WARN", "21"))
 CERT_DAYS_FAIL = int(os.environ.get("CERT_DAYS_FAIL", "7"))
 
@@ -298,10 +303,9 @@ def collect(previous: dict) -> dict:
     for name, stats in srt.items():
         rx = stats.get("rx", 0)
         if rx > 0:
+            # Recorded, not alerted on. Useful as a trend; not evidence of damage.
             pct = 100.0 * stats.get("loss", 0) / rx
             paths.setdefault(name, {})["srt_loss_percent"] = round(pct, 3)
-            if pct > SRT_LOSS_WARN:
-                warnings.append(f"{name}: SRT loss {pct:.2f}% over {SRT_LOSS_WARN}%")
 
     # WITHOUT METRICS, SAY NOTHING ABOUT PUBLISHERS.
     #
@@ -341,6 +345,17 @@ def collect(previous: dict) -> dict:
         if info.get("state") != "ready":
             problems.append(f"{name}: state={info.get('state')}, expected ready")
             continue
+        prev_err = (previous.get("paths") or {}).get(name, {}).get("frame_errors")
+        cur_err = info.get("frame_errors")
+        if prev_err is not None and cur_err is not None:
+            delta_err = cur_err - prev_err
+            info["frame_errors_delta"] = delta_err
+            if delta_err > FRAMES_IN_ERROR_WARN:
+                warnings.append(
+                    f"{name}: {delta_err} errored frames this pass "
+                    f"(over {FRAMES_IN_ERROR_WARN}) - the picture is degrading"
+                )
+
         prev = (previous.get("paths") or {}).get(name, {}).get("bytes")
         cur = info.get("bytes")
         if prev is None:

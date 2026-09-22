@@ -154,7 +154,7 @@ def _only_healthz(mod):
 METRICS_READY = """\
 paths{{name="live-events",state="ready"}} 1
 paths_inbound_bytes{{name="live-events",state="ready"}} {bytes}
-paths_inbound_frames_in_error{{name="live-events",state="ready"}} 0
+paths_inbound_frames_in_error{{name="live-events",state="ready"}} {errs}
 srt_conns_packets_received{{id="a",path="live-events",remoteAddr="1.2.3.4:1",state="publish"}} 1000000
 srt_conns_packets_received_loss{{id="a",path="live-events",remoteAddr="1.2.3.4:1",state="publish"}} {loss}
 paths{{name="news",state="notReady"}} 1
@@ -200,7 +200,7 @@ class PublisherLiveness(unittest.TestCase):
         nothing reaches the displays. One non-zero reading cannot tell this from health -
         only the delta between two can."""
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=1000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=1000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertFalse(snap["healthy"])
         self.assertTrue(any("wedged" in p for p in snap["problems"]), snap["problems"])
@@ -209,14 +209,14 @@ class PublisherLiveness(unittest.TestCase):
         """No previous sample yet. Alerting here would fire on every container start,
         which is every deploy - and an alert that always fires is an alert nobody reads."""
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=1000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=1000, loss=0))
         snap = mod.collect({})
         self.assertEqual(snap["problems"], [])
         self.assertIsNone(snap["paths"]["live-events"]["advancing"])
 
     def test_advancing_bytes_are_healthy(self):
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertEqual(snap["problems"], [])
         self.assertTrue(snap["paths"]["live-events"]["advancing"])
@@ -224,7 +224,7 @@ class PublisherLiveness(unittest.TestCase):
 
     def test_an_expected_publisher_that_is_absent_is_a_problem(self):
         mod = load_watchdog(EXPECTED_PUBLISHERS="live-events,scenic")
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertFalse(snap["healthy"])
         self.assertTrue(any("scenic" in p for p in snap["problems"]), snap["problems"])
@@ -234,7 +234,7 @@ class PublisherLiveness(unittest.TestCase):
         over from Kaltura yet. Expecting all of them would page about seven correct
         absences, which is precisely how a monitor gets muted."""
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertEqual(snap["problems"], [])
         self.assertEqual(snap["paths"]["news"]["state"], "notReady")
@@ -243,22 +243,45 @@ class PublisherLiveness(unittest.TestCase):
 class Severity(unittest.TestCase):
     """Degraded, broken and cannot-see are three different things."""
 
-    def test_srt_loss_warns_and_does_not_fail(self):
-        """Measured 1.69% on the live ingest while planning this. A lossy uplink is worth
-        knowing about and is not an outage; flipping the check to down for it would make a
-        bad afternoon and a dead wall indistinguishable."""
-        mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=90000))  # 9%
-        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
-        self.assertTrue(snap["healthy"], "SRT loss must not fail the check")
-        self.assertTrue(any("SRT loss" in w for w in snap["warnings"]), snap["warnings"])
+    def test_srt_loss_is_recorded_but_never_warns(self):
+        """It was the trigger and it was the wrong metric.
 
-    def test_loss_below_the_threshold_is_silent(self):
+        With eight channels live it read 0.1% to 8.4%, tracking bitrate rather than
+        anything visible; its drop counter matched its retransmit counter to the packet
+        across four independent connections; and raising SRT latency tenfold moved it by
+        noise while frames_in_error stayed at 0 and the displays stayed correct.
+        """
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=10000))  # 1%
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=90000))  # 9%
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertTrue(snap["healthy"])
+        self.assertEqual(snap["warnings"], [], "loss still pages")
+        self.assertEqual(snap["paths"]["live-events"]["srt_loss_percent"], 9.0,
+                         "loss must still be recorded as a trend")
+
+    def test_errored_frames_over_the_threshold_warn(self):
+        """The signal that does mean picture damage."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=50, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000, "frame_errors": 0}}})
+        self.assertTrue(snap["healthy"], "degrading is not an outage")
+        self.assertTrue(any("errored frames" in w for w in snap["warnings"]), snap["warnings"])
+
+    def test_errored_frames_are_measured_per_pass_not_cumulatively(self):
+        """A lifetime counter warns forever after one blip. Only the delta matters."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=5000, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000, "frame_errors": 4998}}})
+        self.assertEqual(snap["warnings"], [],
+                         "a high lifetime count warned despite only 2 new errors")
+        self.assertEqual(snap["paths"]["live-events"]["frame_errors_delta"], 2)
+
+    def test_the_first_pass_cannot_judge_frame_errors(self):
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=9999, bytes=2000, loss=0))
+        snap = mod.collect({})
         self.assertEqual(snap["warnings"], [])
-        self.assertEqual(snap["paths"]["live-events"]["srt_loss_percent"], 1.0)
+        self.assertNotIn("frame_errors_delta", snap["paths"]["live-events"])
 
     def test_unreadable_metrics_is_a_watchdog_fault_not_a_healthy_relay(self):
         """The monitor could not see. Reporting that as healthy hides an outage."""
@@ -274,7 +297,7 @@ class Severity(unittest.TestCase):
         """A run that checked nothing must never report healthy. If the render stops
         emitting the variable, that is a rendering bug, not an empty estate."""
         mod = load_watchdog(EXPECTED_PUBLISHERS=None)
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertFalse(snap["healthy"])
         self.assertTrue(any("unset" in f for f in snap["faults"]), snap["faults"])
@@ -282,7 +305,7 @@ class Severity(unittest.TestCase):
     def test_nothing_expected_yet_warns_rather_than_claiming_health(self):
         """True today - no channel declares publishing: true. Distinct from unset."""
         mod = load_watchdog(EXPECTED_PUBLISHERS="")
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({})
         self.assertTrue(any("no channel" in w for w in snap["warnings"]), snap["warnings"])
         self.assertEqual(snap["faults"], [])
@@ -294,7 +317,7 @@ class Delivery(unittest.TestCase):
         reloads - so when nginx dies the container stays up, restart: unless-stopped never
         fires, and docker ps shows it running. Nothing else in the stack notices."""
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0), nginx_ok=False)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0), nginx_ok=False)
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertFalse(snap["healthy"])
         self.assertTrue(any("nginx" in p for p in snap["problems"]), snap["problems"])
@@ -310,7 +333,7 @@ class ViewerTelemetry(unittest.TestCase):
         tmp.close()
         self.addCleanup(os.unlink, tmp.name)
         mod = load_watchdog(ACCESS_LOG=tmp.name, **env)
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         return mod, mod.collect({"paths": {"live-events": {"bytes": 1000}}}), tmp.name
 
     @staticmethod
@@ -375,7 +398,7 @@ class ViewerTelemetry(unittest.TestCase):
     def test_a_missing_access_log_does_not_crash(self):
         """It does not exist until nginx has served its first /hls/ request."""
         mod = load_watchdog(ACCESS_LOG="/nonexistent/access.log")
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertEqual(snap["problems"], [])
 
@@ -394,7 +417,7 @@ class Certificate(unittest.TestCase):
         self.addCleanup(server.close)
         mod = load_watchdog(TLS_HOST="127.0.0.1", TLS_PORT=str(server.port),
                             TLS_SNI="relay-test")
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         return mod.collect({"paths": {"live-events": {"bytes": 1000}}})
 
     def test_a_healthy_certificate_is_silent(self):
@@ -417,7 +440,7 @@ class Certificate(unittest.TestCase):
     def test_an_unreachable_listener_is_a_fault_not_a_pass(self):
         """Cannot-see, again. A silent None here would read as a healthy certificate."""
         mod = load_watchdog(TLS_HOST="127.0.0.1", TLS_PORT="1", TLS_SNI="relay-test")
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
         self.assertTrue(any("certificate" in f for f in snap["faults"]), snap["faults"])
 
@@ -436,7 +459,7 @@ class Reporting(unittest.TestCase):
 
     def test_the_summary_names_the_next_command(self):
         mod = load_watchdog()
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         text = mod.summarise(mod.collect({"paths": {"live-events": {"bytes": 1000}}}))
         self.assertIn("gh workflow run watchdog.yml", text)
 
@@ -455,7 +478,7 @@ class Reporting(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
         target = os.path.join(d, "sub", "status.json")
         mod = load_watchdog(STATUS_PATH=target)
-        fake_metrics(mod, METRICS_READY.format(bytes=2000, loss=0))
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
         mod.write_status(mod.collect({"paths": {"live-events": {"bytes": 1000}}}))
         self.assertTrue(os.path.exists(target))
         json.load(open(target))
