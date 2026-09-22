@@ -64,7 +64,17 @@ else
 fi
 
 # Renders mediamtx.yml from the template plus the Key Vault passphrase.
+#
+# The hash is taken either side, because a CONFIG-ONLY change never reaches MediaMTX on
+# its own: mediamtx.yml is a bind-mounted file, and `compose up -d` recreates a container
+# only when its SERVICE DEFINITION changes. Adding a path to the template therefore
+# converged "successfully" while the relay kept serving the config it booted with -
+# green deploy, green healthcheck, and a publisher rejected because its path did not
+# exist. Found with a container 26 hours older than the config it was supposedly running.
+CFG=/etc/stream-relay/mediamtx.yml
+before=$(sha256sum "$CFG" 2>/dev/null | cut -d' ' -f1 || true)
 /usr/local/bin/relay-render.sh
+after=$(sha256sum "$CFG" 2>/dev/null | cut -d' ' -f1 || true)
 
 # Validate before restarting anything: a bad nginx.conf takes /meet/ down with the relay.
 #
@@ -90,6 +100,13 @@ if command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"; else DC=
 # --build so a changed watchdog.py is actually rebuilt. No other service declares
 # `build:`, so this is a no-op for them.
 $DC up -d --build --remove-orphans
+
+# Restart only when the config actually changed. Unconditional would drop every
+# publisher on every deploy, including the no-op converges that run far more often.
+if [ "$before" != "$after" ]; then
+  echo "mediamtx.yml changed; restarting the relay to load it"
+  docker restart stream-relay >/dev/null
+fi
 
 for _ in $(seq 1 24); do
   if [ "$(docker inspect stream-relay --format '{{.State.Health.Status}}' 2>/dev/null)" = healthy ]; then

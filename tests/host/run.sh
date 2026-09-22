@@ -165,6 +165,30 @@ else
   t_fail "relay-apply.sh validates against an unpinned nginx:alpine"
 fi
 
+# --- 4d. a config-only change must actually reach MediaMTX --------------------------------
+# mediamtx.yml is a bind-mounted file, and `compose up -d` recreates a container only when
+# its SERVICE DEFINITION changes. Adding a path to the template therefore converged
+# "successfully" while the relay kept serving the config it booted with - green deploy,
+# green healthcheck, and a publisher rejected for a path that did not exist. The container
+# was 26 hours older than the config it was supposedly running.
+if grep -q 'before=\$(sha256sum' "$HOST_DIR/bin/relay-apply.sh"; then
+  t_ok "relay-apply.sh hashes the rendered config either side of rendering"
+else
+  t_fail "relay-apply.sh cannot tell whether the config changed"
+fi
+if [ "${apply#*docker restart stream-relay}" != "$apply" ]; then
+  t_ok "relay-apply.sh restarts the relay when the config changed"
+else
+  t_fail "a config-only change would never reach MediaMTX"
+fi
+# Conditional, not unconditional: every no-op converge would otherwise drop every
+# publisher, and those run far more often than real changes.
+if grep -q 'if \[ "\$before" != "\$after" \]' "$HOST_DIR/bin/relay-apply.sh"; then
+  t_ok "the restart is conditional on the config actually changing"
+else
+  t_fail "the relay restarts on every converge, dropping publishers needlessly"
+fi
+
 # --- 5. the manifest covers every committed artifact ------------------------------------
 # A file added to host/ but not to MANIFEST is never checked, and the suite above would
 # still be green - so the set itself is asserted.
