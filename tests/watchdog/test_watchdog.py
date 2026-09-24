@@ -239,6 +239,71 @@ class PublisherLiveness(unittest.TestCase):
         self.assertEqual(snap["problems"], [])
         self.assertEqual(snap["paths"]["news"]["state"], "notReady")
 
+    # --- a counter that went backwards -------------------------------------------------
+    # 2026-09-23: all nine producers dropped and reconnected twice. The second outage
+    # (23:28:01-23:29:49) fell entirely between two passes, so the watchdog never saw it;
+    # what it saw at 23:31 was eight restarted byte counters, and it paged for eight wedged
+    # publishers 72 seconds after every one of them had recovered. The only alert anyone
+    # got that time was the false one.
+
+    def test_a_restarted_counter_is_a_reconnect_not_a_wedge(self):
+        """Lower than last pass is impossible for one publisher session, so it is a new
+        one. Calling that wedged pages for a channel that is up and streaming."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=500, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 900_000_000}}})
+        self.assertEqual(snap["problems"], [], "a recovered channel must not page")
+        self.assertTrue(snap["healthy"])
+        self.assertTrue(snap["paths"]["live-events"]["reconnected"])
+
+    def test_a_reconnect_is_still_said_out_loud(self):
+        """The channel was down. At a 5-minute interval a 110-second drop is otherwise
+        invisible, so silence here would trade a false alarm for a blind spot."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=500, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 900_000_000}}})
+        self.assertTrue(
+            any("reconnected" in w for w in snap["warnings"]), snap["warnings"]
+        )
+
+    def test_a_channel_that_keeps_reconnecting_eventually_fails(self):
+        """Warning every pass would let a channel flap all night without ever failing.
+
+        The readings are what a real flap looks like: each pass catches a session younger
+        than the one before it, so the counter keeps landing lower. (Two sessions of the
+        SAME age read equal, and that is the wedge case, not this one.)"""
+        mod = load_watchdog()
+        prev = {"paths": {"live-events": {"bytes": 900_000_000}}}
+        for reading in (20_000_000, 5_000_000):
+            fake_metrics(mod, METRICS_READY.format(errs=0, bytes=reading, loss=0))
+            snap = mod.collect(prev)
+            prev = snap
+        self.assertEqual(snap["paths"]["live-events"]["reconnect_runs"],
+                         mod.RECONNECT_RUNS_FAIL)
+        self.assertFalse(snap["healthy"])
+        self.assertTrue(any("flapping" in p for p in snap["problems"]), snap["problems"])
+
+    def test_recovering_clears_the_flap_count(self):
+        """Two reconnects an hour apart are not a flapping channel. Only consecutive
+        passes count, or one bad night would arm the failure forever."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=500, loss=0))
+        first = mod.collect({"paths": {"live-events": {"bytes": 900_000_000}}})
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=5000, loss=0))
+        steady = mod.collect(first)          # advanced normally; incident over
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=500, loss=0))
+        later = mod.collect(steady)          # a fresh, unrelated reconnect
+        self.assertEqual(later["problems"], [], later["problems"])
+        self.assertEqual(later["paths"]["live-events"]["reconnect_runs"], 1)
+
+    def test_an_unchanged_counter_is_still_a_wedge(self):
+        """The guard above must not swallow the case it was built around: equal is not
+        lower, and a frozen publisher stays a problem."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=1000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertTrue(any("wedged" in p for p in snap["problems"]), snap["problems"])
+
 
 class Severity(unittest.TestCase):
     """Degraded, broken and cannot-see are three different things."""

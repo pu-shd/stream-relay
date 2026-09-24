@@ -86,6 +86,11 @@ FRAMES_IN_ERROR_WARN = int(os.environ.get("FRAMES_IN_ERROR_WARN", "10"))
 CERT_DAYS_WARN = int(os.environ.get("CERT_DAYS_WARN", "21"))
 CERT_DAYS_FAIL = int(os.environ.get("CERT_DAYS_FAIL", "7"))
 
+# A publisher that reconnects once has recovered; one that reconnects on this many passes
+# in a row has not, and a warning each time would let it flap indefinitely without ever
+# failing. Two passes is ten minutes of a channel that will not stay up.
+RECONNECT_RUNS_FAIL = int(os.environ.get("RECONNECT_RUNS_FAIL", "2"))
+
 # Trailing slash would make the failure ping "<url>//fail", which 404s silently - so the
 # one signal that matters most would never arrive.
 HC_URL = os.environ.get("HEALTHCHECKS_URL", "").strip().rstrip("/")
@@ -356,13 +361,52 @@ def collect(previous: dict) -> dict:
                     f"(over {FRAMES_IN_ERROR_WARN}) - the picture is degrading"
                 )
 
-        prev = (previous.get("paths") or {}).get(name, {}).get("bytes")
+        prev_path = (previous.get("paths") or {}).get(name, {})
+        prev = prev_path.get("bytes")
         cur = info.get("bytes")
-        if prev is None:
+        if prev is None or cur is None:
             info["advancing"] = None  # first pass; nothing to compare against yet
-        elif cur is not None and cur > prev:
+        elif cur > prev:
             info["advancing"] = True
             info["bytes_delta"] = cur - prev
+        elif cur < prev:
+            # A COUNTER THAT WENT BACKWARDS IS A NEW PUBLISHER, NOT A WEDGED ONE.
+            #
+            # paths_inbound_bytes counts one publisher session and restarts at zero when
+            # the next one connects, so a lower reading means the publisher dropped and
+            # came back between passes. Read as "not greater than last time" that is
+            # indistinguishable from wedged, and on 2026-09-23 it paged for all eight
+            # channels at 23:31 - 72 seconds AFTER they had all recovered. Worse, the
+            # outage itself (23:28:01-23:29:49) fell between two passes and would
+            # otherwise have gone unreported entirely: the only alert anyone got was the
+            # false one, for the recovery.
+            #
+            # So this is a WARNING, not a problem. The channel is up right now, which is
+            # what /fail is for; but it was down, and that is worth saying out loud -
+            # short drops are otherwise invisible at a 5-minute sampling interval.
+            #
+            # LIMIT: this sees a reconnect only when the new session reads LOWER than the
+            # last pass did. A channel that drops just after a pass and has been back for
+            # most of the interval can read higher, and is then indistinguishable from one
+            # that never dropped. It fails safe - silence, not a false alarm - but it does
+            # mean this is a floor on reconnects, never a count of them.
+            runs = prev_path.get("reconnect_runs", 0) + 1
+            info["advancing"] = True
+            info["reconnected"] = True
+            info["reconnect_runs"] = runs
+            info["bytes_delta"] = cur
+            if runs >= RECONNECT_RUNS_FAIL:
+                # Warning every pass would let a channel flap forever without ever
+                # failing. Repeatedly is a different condition from once.
+                problems.append(
+                    f"{name}: publisher has reconnected on {runs} consecutive passes - "
+                    f"the channel is flapping, not merely recovered"
+                )
+            else:
+                warnings.append(
+                    f"{name}: publisher reconnected since the last pass (byte counter "
+                    f"restarted, now {cur}) - the channel was briefly down"
+                )
         else:
             # THE failure a single reading cannot see. A frozen non-zero counter is
             # exactly what a wedged publisher looks like, and `ready: true` stays true.
