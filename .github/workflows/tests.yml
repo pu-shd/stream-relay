@@ -135,6 +135,40 @@ jobs:
       - name: The image builds
         run: docker build -q -t relay-watchdog:ci docker/watchdog
 
+  maintenance:
+    name: Maintenance slate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: The switch tool's offline suite
+        # Against a model of the rendered nginx rules, so each test asks what a VIEWER is
+        # served, not whether a file was written.
+        run: python3 tests/maintenance/test_maintenance.py
+      - name: The slate builds, and streams what the channels advertise
+        # Built and RUN, not just built: the first version looped an MPEG-TS clip, which
+        # built fine and produced one 30-second segment instead of 4-second ones.
+        run: |
+          set -euo pipefail
+          docker build -q -t relay-slate:ci docker/slate
+          docker volume create slate-ci >/dev/null
+          docker run --rm -v slate-ci:/slate alpine:3.22 chown 10002:10002 /slate
+          docker run -d --name slate-ci -v slate-ci:/slate relay-slate:ci >/dev/null
+          sleep 20
+          out=$(docker run --rm -v slate-ci:/slate alpine:3.22 sh -c \
+            'cat /slate/index.m3u8 /slate/main_stream.m3u8; ls /slate | grep -c "^slate_seg"')
+          docker logs slate-ci 2>&1 | tail -5
+          echo "$out"
+          segs=$(echo "$out" | tail -1)
+          [ "$segs" -ge 3 ] || { echo "::error::only $segs segments after 20s"; exit 1; }
+          echo "$out" | grep -q 'CODECS="avc1.640028,mp4a.40.2"' \
+            || { echo "::error::slate does not advertise High@4.0 + AAC"; exit 1; }
+          echo "$out" | grep -q '^#EXT-X-TARGETDURATION:4$' \
+            || { echo "::error::segments are not 4s"; exit 1; }
+          seq=$(echo "$out" | grep -oE 'MEDIA-SEQUENCE:[0-9]+' | cut -d: -f2)
+          [ "$seq" -gt 1000000000 ] \
+            || { echo "::error::media sequence $seq is not epoch-based"; exit 1; }
+          docker rm -f slate-ci >/dev/null
+
   mock-az:
     name: Deployment scripts (mock az)
     runs-on: ubuntu-latest

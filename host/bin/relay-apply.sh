@@ -27,6 +27,27 @@ if [ -d "$STAGE/watchdog" ]; then
   install -m 0644 "$STAGE/watchdog/watchdog.py" "$PROJECT/watchdog/watchdog.py"
 fi
 
+# The maintenance slate's build context: the engine's Dockerfile and loop, with the
+# department's slate.png staged over the neutral default. Optional for the same reason.
+if [ -d "$STAGE/slate" ]; then
+  install -d -m 0755 "$PROJECT/slate"
+  install -m 0644 "$STAGE/slate/Dockerfile" "$PROJECT/slate/Dockerfile"
+  install -m 0755 "$STAGE/slate/slate.sh"   "$PROJECT/slate/slate.sh"
+  install -m 0644 "$STAGE/slate/slate.png"  "$PROJECT/slate/slate.png"
+fi
+
+# The slate's output, owned by the uid it runs as (docker/slate/Dockerfile; a cross-repo
+# test pins the two together). nginx and the watchdog read it; nothing else writes it.
+SLATE_UID=10002
+install -d -m 0755 -o "$SLATE_UID" -g "$SLATE_UID" /srv/relay-slate
+
+# The maintenance flag directory, owned by the Actions runner's account. Setting and
+# clearing the flag is the whole of the maintenance workflow, and giving the runner this
+# one directory is what lets it do that WITHOUT a third sudoers entry: it changes what is
+# shown, never what is deployed. nginx and the watchdog mount it read-only.
+RELAY_OPERATOR=ghrunner
+install -d -m 0755 -o "$RELAY_OPERATOR" -g "$RELAY_OPERATOR" /srv/relay-maintenance
+
 # The watchdog's two writable directories, owned by the uid it runs as.
 #
 # nginx runs as root and creates the access log root:root, which an unprivileged watchdog

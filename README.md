@@ -135,6 +135,35 @@ Viewer counts come from the nginx log and nowhere else: nginx serves the segment
 MediaMTX's `readers` is permanently 0. Client addresses are retained only for device
 classes declaring `retain_address`; everyone else is counted and discarded.
 
+## Maintenance slate
+
+For producer maintenance: every channel onto one still image, and back.
+
+`docker/slate/` encodes the image once at build (1080p, High@4.0 to match what the channels
+advertise, one keyframe per 4 s) and loops it forever with `-c copy` into a live HLS window
+— ~0.4 % of a core. It runs **all the time**, so it is never untested at the moment it is
+needed.
+
+The switch is **in nginx**, not MediaMTX. While `<maintenance_dir>/active` exists, every
+`/hls/<channel>/…` request is served from the slate. The producers keep publishing to their
+real paths throughout, untouched, and `/hls-live/<channel>/…` bypasses the switch so their
+output can be checked before switching back. Nothing restarts; the file is tested per
+request.
+
+`scripts/maintenance.py on|off|status` sets and clears the flag, run by the config repo's
+`Maintenance` workflow as the runner's own account — no sudo. `on` refuses a stale slate and
+confirms every channel is actually being served it. `off` refuses until every expected
+publisher is ready **and advancing**, then serves 503 on the playlists for `gap_seconds`
+before the real ones.
+
+The gap exists because the slate numbers segments from the Unix epoch and MediaMTX
+restarts at 0 on every reconnect: onto the slate is a forward jump, back is a regression.
+The gap reproduces what players already survive on a producer reconnect. **Its length is
+not verified on Apple TVs** — rehearse on one display.
+
+The watchdog knows the flag: missing publishers become warnings, while a frozen slate on air,
+a flag older than `max_hours`, and a stuck gap become problems.
+
 ## Access control
 
 The NSG is the boundary. No WAF, no CDN.

@@ -11,6 +11,8 @@ watchdog reported green.
 import atexit
 import importlib.util
 import json
+from datetime import datetime, timezone
+import time
 import os
 import shutil
 import subprocess
@@ -374,6 +376,153 @@ class Severity(unittest.TestCase):
         snap = mod.collect({})
         self.assertTrue(any("no channel" in w for w in snap["warnings"]), snap["warnings"])
         self.assertEqual(snap["faults"], [])
+
+
+class MaintenanceSlate(unittest.TestCase):
+    """While the flag is set, the producers being down is the point, not the outage.
+
+    What becomes the outage instead is the slate itself: frozen while on air, every display
+    is frozen; left on for hours, the wall says "back shortly" while everything reports
+    healthy. Both have to be problems, or the feature trades one silent failure for two.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.maint = os.path.join(self.tmp, "maintenance")
+        os.mkdir(self.maint)
+        self.playlist = os.path.join(self.tmp, "main_stream.m3u8")
+        self._touch(self.playlist)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _touch(path, age=0.0, body=""):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        t = time.time() - age
+        os.utime(path, (t, t))
+
+    def _mod(self, **env):
+        return load_watchdog(MAINTENANCE_DIR=self.maint, SLATE_PLAYLIST=self.playlist,
+                             SLATE_STALE_SECONDS="12", SLATE_MAX_HOURS="4", **env)
+
+    def _set(self, age=0.0, by="a-maintainer"):
+        since = datetime.now(timezone.utc).timestamp() - age
+        body = json.dumps({"since": datetime.fromtimestamp(since, timezone.utc).isoformat(),
+                           "by": by})
+        self._touch(os.path.join(self.maint, "active"), age=age, body=body)
+
+    def test_a_missing_publisher_in_maintenance_warns_instead_of_paging(self):
+        """A planned producer reboot must not page. It must still say which are down -
+        that is exactly the question before switching back."""
+        mod = self._mod(EXPECTED_PUBLISHERS="live-events,scenic")
+        self._set()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertEqual(snap["problems"], [], snap["problems"])
+        self.assertTrue(snap["healthy"])
+        self.assertTrue(any("in maintenance, expected" in w and "scenic" in w
+                            for w in snap["warnings"]), snap["warnings"])
+
+    def test_the_same_absence_outside_maintenance_still_pages(self):
+        """The guard must not leak: without the flag, a missing publisher is an outage."""
+        mod = self._mod(EXPECTED_PUBLISHERS="live-events,scenic")
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertTrue(any("scenic" in p for p in snap["problems"]), snap["problems"])
+
+    def test_a_frozen_slate_on_air_is_a_problem(self):
+        mod = self._mod()
+        self._set()
+        self._touch(self.playlist, age=60)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertFalse(snap["healthy"])
+        self.assertTrue(any("every display is frozen" in p for p in snap["problems"]),
+                        snap["problems"])
+
+    def test_a_frozen_slate_off_air_warns(self):
+        """Nobody is watching it yet, so it is not an outage - but it is the reason the
+        next maintenance would fail, and that is worth knowing before it is needed."""
+        mod = self._mod()
+        self._touch(self.playlist, age=60)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertEqual(snap["problems"], [])
+        self.assertTrue(any("slate is not updating" in w for w in snap["warnings"]),
+                        snap["warnings"])
+
+    def test_a_missing_slate_playlist_is_not_fresh(self):
+        mod = self._mod()
+        os.unlink(self.playlist)
+        self._set()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertFalse(snap["slate"]["fresh"])
+        self.assertTrue(any("every display is frozen" in p for p in snap["problems"]))
+
+    def test_a_forgotten_flag_fails(self):
+        mod = self._mod()
+        self._set(age=5 * 3600)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertFalse(snap["healthy"])
+        self.assertTrue(any("probably forgotten" in p for p in snap["problems"]),
+                        snap["problems"])
+
+    def test_a_recent_flag_is_announced_not_failed(self):
+        mod = self._mod()
+        self._set(age=600)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertEqual(snap["problems"], [])
+        self.assertTrue(snap["maintenance"]["active"])
+        self.assertEqual(snap["maintenance"]["by"], "a-maintainer")
+        self.assertTrue(any(w.startswith("MAINTENANCE:") for w in snap["warnings"]))
+
+    def test_a_hand_made_flag_is_still_maintenance(self):
+        """`touch active` on the host has no JSON in it. Its age comes from the file."""
+        mod = self._mod()
+        self._touch(os.path.join(self.maint, "active"), age=5 * 3600, body="")
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertTrue(snap["maintenance"]["active"])
+        self.assertTrue(any("probably forgotten" in p for p in snap["problems"]))
+
+    def test_a_stuck_gap_fails(self):
+        """A switch-back that died half way leaves every playlist answering 503."""
+        mod = self._mod()
+        self._touch(os.path.join(self.maint, "gap"), age=mod.GAP_STUCK_SECONDS + 60)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertTrue(any("answering 503" in p for p in snap["problems"]), snap["problems"])
+
+    def test_a_brief_gap_only_warns(self):
+        mod = self._mod()
+        self._touch(os.path.join(self.maint, "gap"), age=5)
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertEqual(snap["problems"], [])
+
+    def test_no_slate_configured_checks_nothing(self):
+        """An engine deployed without the feature must not fault on its absence."""
+        mod = load_watchdog()
+        fake_metrics(mod, METRICS_READY.format(errs=0, bytes=2000, loss=0))
+        snap = mod.collect({"paths": {"live-events": {"bytes": 1000}}})
+        self.assertEqual(snap["problems"], [])
+        self.assertFalse(snap["maintenance"]["active"])
+        self.assertFalse(snap["slate"]["configured"])
+
+    def test_unreadable_metrics_still_report_maintenance(self):
+        """The fault path returns early; the status report must still show the flag."""
+        mod = self._mod()
+        self._set()
+        fake_metrics(mod, "")
+        mod.urllib.request.urlopen = _only_healthz(mod)   # metrics unreachable
+        snap = mod.collect({})
+        self.assertTrue(snap["faults"])
+        self.assertTrue(snap["maintenance"]["active"])
 
 
 class Delivery(unittest.TestCase):

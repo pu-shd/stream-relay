@@ -37,6 +37,13 @@ THREE SEVERITIES, and the distinction is the whole point:
   fault    -> /fail, but says WATCHDOG PROBLEM. The monitor could not see. Reporting that
               as healthy hides an outage; reporting it as an outage cries wolf. It is its
               own thing.
+
+MAINTENANCE. While the maintenance flag is set, every channel is served from the slate,
+so a missing publisher is the point of the exercise rather than an outage: publisher
+problems are reported as warnings. What becomes a problem instead is the slate itself -
+if it stops updating while it is on air, every display is frozen - and a flag left on
+past maintenance.slate.max_hours, which is a wall saying "back shortly" indefinitely while
+everything else reports healthy.
 """
 import json
 import os
@@ -94,6 +101,18 @@ RECONNECT_RUNS_FAIL = int(os.environ.get("RECONNECT_RUNS_FAIL", "2"))
 # Trailing slash would make the failure ping "<url>//fail", which 404s silently - so the
 # one signal that matters most would never arrive.
 HC_URL = os.environ.get("HEALTHCHECKS_URL", "").strip().rstrip("/")
+
+# The maintenance slate. Unset means this deployment has none, and none of the slate
+# checks run - an engine without the feature must not fault on its absence.
+MAINTENANCE_DIR = os.environ.get("MAINTENANCE_DIR", "")
+SLATE_PLAYLIST = os.environ.get("SLATE_PLAYLIST", "")
+# Three segments. One late rewrite is a slow disk; three is a stopped ffmpeg.
+SLATE_STALE_SECONDS = float(os.environ.get("SLATE_STALE_SECONDS", "12"))
+SLATE_MAX_HOURS = float(os.environ.get("SLATE_MAX_HOURS", "4"))
+# The switch back holds playlists at 503 for maintenance.slate.gap_seconds (<= 300 by
+# validation). A gap file older than this is a switch-back that died half way, and it
+# means EVERY playlist on the relay is answering 503.
+GAP_STUCK_SECONDS = 600
 
 try:
     CLIENT_CLASSES = json.loads(os.environ.get("CLIENT_CLASSES", "[]"))
@@ -270,6 +289,59 @@ def ping(url: str, body: str, fail: bool) -> str:
         return f"unreachable ({exc})"
 
 
+def maintenance_state(now: datetime) -> dict:
+    """What the flag files say. Read from the directory nginx tests, so this reports
+    what viewers are actually being served, not what a workflow believes it set."""
+    state = {"active": False, "gap": False, "since": None, "by": None,
+             "age_hours": None, "gap_age_seconds": None}
+    if not MAINTENANCE_DIR:
+        return state
+    active = os.path.join(MAINTENANCE_DIR, "active")
+    gap = os.path.join(MAINTENANCE_DIR, "gap")
+    if os.path.exists(active):
+        state["active"] = True
+        meta: dict = {}
+        try:
+            with open(active, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            # A hand-made `touch` is still maintenance. Its age comes from the file.
+            meta = {}
+        since = None
+        if isinstance(meta, dict) and meta.get("since"):
+            try:
+                since = datetime.fromisoformat(str(meta["since"]))
+            except ValueError:
+                since = None
+        if since is None:
+            try:
+                since = datetime.fromtimestamp(os.path.getmtime(active), timezone.utc)
+            except OSError:
+                since = now
+        state["since"] = since.isoformat()
+        state["by"] = (meta.get("by") if isinstance(meta, dict) else None) or None
+        state["age_hours"] = round((now - since).total_seconds() / 3600, 2)
+    if os.path.exists(gap):
+        state["gap"] = True
+        try:
+            state["gap_age_seconds"] = round(now.timestamp() - os.path.getmtime(gap), 1)
+        except OSError:
+            state["gap_age_seconds"] = None
+    return state
+
+
+def slate_state(now: datetime) -> dict:
+    """Is the slate's playlist still being rewritten?"""
+    if not SLATE_PLAYLIST:
+        return {"configured": False, "age_seconds": None, "fresh": None}
+    try:
+        age = now.timestamp() - os.path.getmtime(SLATE_PLAYLIST)
+    except OSError:
+        return {"configured": True, "age_seconds": None, "fresh": False}
+    return {"configured": True, "age_seconds": round(age, 1),
+            "fresh": age < SLATE_STALE_SECONDS}
+
+
 def collect(previous: dict) -> dict:
     now = datetime.now(timezone.utc)
     problems: list[str] = []
@@ -331,6 +403,8 @@ def collect(previous: dict) -> dict:
             "nginx_serving": nginx_serving(),
             "cert_days_left": None,
             "paths": {},
+            "maintenance": maintenance_state(now),
+            "slate": slate_state(now),
         }
 
     if EXPECTED_UNSET:
@@ -342,6 +416,7 @@ def collect(previous: dict) -> dict:
         # Legitimate today - no channel has cut over - and it must not read as healthy.
         warnings.append("no channel declares publishing: true, so no publisher is expected")
 
+    publisher_problems_from = len(problems)
     for name in EXPECTED:
         info = paths.get(name)
         if info is None:
@@ -417,6 +492,14 @@ def collect(previous: dict) -> dict:
                 f"({cur} bytes) - the publisher is wedged"
             )
 
+    maint = maintenance_state(now)
+    if maint["active"] and len(problems) > publisher_problems_from:
+        # The producers being down is what maintenance is FOR. Still said, so the report
+        # shows which of them are back yet - that is the question before switching back.
+        moved = problems[publisher_problems_from:]
+        del problems[publisher_problems_from:]
+        warnings.extend(f"in maintenance, expected: {p}" for p in moved)
+
     # --- viewers ----------------------------------------------------------------------
     rows, malformed = LogTail(ACCESS_LOG).drain()
     if malformed:
@@ -461,6 +544,43 @@ def collect(previous: dict) -> dict:
     elif days < CERT_DAYS_WARN:
         warnings.append(f"certificate expires in {days:.1f} days")
 
+    # --- maintenance slate ------------------------------------------------------------
+    slate = slate_state(now)
+    if slate["configured"] and not slate["fresh"]:
+        age = "missing" if slate["age_seconds"] is None else f"{slate['age_seconds']:.0f}s old"
+        if maint["active"]:
+            problems.append(
+                f"the wall is on the maintenance slate and the slate is not updating "
+                f"(playlist {age}) - every display is frozen"
+            )
+        else:
+            warnings.append(
+                f"the maintenance slate is not updating (playlist {age}); switching to it "
+                f"now would freeze every display, so maintenance.yml will refuse"
+            )
+    if maint["active"]:
+        who = f" by {maint['by']}" if maint["by"] else ""
+        if maint["age_hours"] is not None and maint["age_hours"] > SLATE_MAX_HOURS:
+            problems.append(
+                f"every channel has been on the maintenance slate for "
+                f"{maint['age_hours']:.1f}h{who} (max {SLATE_MAX_HOURS:g}h) - probably "
+                f"forgotten. Run: gh workflow run maintenance.yml -f action=status"
+            )
+        else:
+            warnings.append(
+                f"MAINTENANCE: every channel is showing the slate, since {maint['since']}{who}"
+            )
+    if maint["gap"]:
+        age = maint["gap_age_seconds"]
+        if age is not None and age > GAP_STUCK_SECONDS:
+            problems.append(
+                f"the maintenance gap has been set for {age:.0f}s - every playlist on the "
+                f"relay is answering 503. A switch-back died half way; re-run "
+                f"maintenance.yml -f action=off"
+            )
+        else:
+            warnings.append("switching back from maintenance: playlists are briefly 503")
+
     healthy = not problems and not faults
     return {
         "generated": now.isoformat(),
@@ -473,6 +593,8 @@ def collect(previous: dict) -> dict:
         "nginx_serving": serving,
         "cert_days_left": None if days is None else round(days, 1),
         "paths": paths,
+        "maintenance": maint,
+        "slate": slate,
     }
 
 
