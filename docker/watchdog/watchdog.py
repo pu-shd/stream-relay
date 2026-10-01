@@ -206,10 +206,13 @@ def cert_days_left() -> float | None:
         return None
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    # Not verifying: the certificate is issued for the public name and this connects to
-    # the container by its compose alias, so the hostname would never match and the CA
-    # path is not the question. What is wanted is the peer's notAfter. SNI is still sent,
-    # so nginx picks the right certificate.
+    # TLS 1.2 floor. nginx offers only 1.2 and 1.3, so this changes nothing on the wire;
+    # without it the context would accept 1.0/1.1 from a peer that offered them.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # Not verifying, deliberately. What is wanted is the peer's notAfter, and verification
+    # would REFUSE an expired certificate at the handshake - turning "the certificate has
+    # expired", the problem this check exists to report, into "could not read the
+    # certificate", a watchdog fault. SNI is still sent, so nginx picks the right one.
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
@@ -254,10 +257,11 @@ def nginx_serving() -> bool | None:
     if NGINX_HEALTH.startswith("https://"):
         import ssl
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # see cert_days_left()
         # The certificate is issued for the public name; this connects to the container by
         # its compose alias. Verifying would fail on the name, and the question here is
-        # only "does nginx answer", not "is the chain good" - cert validity is checked
-        # separately and properly from the file.
+        # only "does nginx answer", not "is the chain good" - the certificate itself is
+        # checked separately, off the handshake, by cert_days_left().
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     try:

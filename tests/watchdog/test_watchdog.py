@@ -525,6 +525,62 @@ class MaintenanceSlate(unittest.TestCase):
         self.assertTrue(snap["maintenance"]["active"])
 
 
+class TLSFloor(unittest.TestCase):
+    """Every TLS context the watchdog builds refuses anything below TLS 1.2.
+
+    Driven through the real functions rather than grepped: each SSLContext constructed
+    while they run is recorded, so a third probe added later without the floor fails here.
+    (CodeQL py/insecure-protocol, stream-relay alert #1.)
+
+    The floor deliberately comes WITHOUT certificate verification - verifying would refuse
+    an expired certificate at the handshake and report it as "could not read" rather than
+    as expiry. That is already guarded: the Certificate tests run against self-signed
+    certificates, which verification would refuse just the same.
+    """
+
+    def _contexts_built_by(self, fn, **env):
+        import ssl
+        built = []
+        real_new = ssl.SSLContext.__new__
+
+        # Wrap the real class's __new__ rather than replacing ssl.SSLContext: the ssl
+        # module's own property setters refer to the global name, and a subclass swapped
+        # in there makes `minimum_version = ...` recurse into itself.
+        def recording_new(cls, *a, **kw):
+            ctx = real_new(cls, *a, **kw)
+            # Start every context at the WEAKEST default an older OpenSSL would give.
+            # On a current one PROTOCOL_TLS_CLIENT already defaults to 1.2, and a test
+            # that only reads the default passes whether or not the watchdog sets the
+            # floor - which is exactly what the first version of this test did. Here only
+            # an explicit assignment in the watchdog can raise it back.
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+            built.append(ctx)
+            return ctx
+
+        mod = load_watchdog(**env)
+        ssl.SSLContext.__new__ = recording_new
+        try:
+            getattr(mod, fn)()
+        finally:
+            ssl.SSLContext.__new__ = real_new
+        return built
+
+    def _assert_floor(self, built):
+        import ssl
+        self.assertTrue(built, "no TLS context was built, so nothing was checked")
+        for ctx in built:
+            self.assertGreaterEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_the_certificate_probe_refuses_old_tls(self):
+        # Port 1 refuses; the context is built before the connection is attempted.
+        self._assert_floor(self._contexts_built_by(
+            "cert_days_left", TLS_HOST="127.0.0.1", TLS_PORT="1", TLS_SNI="relay-test"))
+
+    def test_the_nginx_probe_refuses_old_tls(self):
+        self._assert_floor(self._contexts_built_by(
+            "nginx_serving", NGINX_HEALTH="https://127.0.0.1:1/healthz"))
+
+
 class Delivery(unittest.TestCase):
     def test_a_dead_nginx_is_a_problem_even_though_its_container_is_up(self):
         """PID 1 in that container is the SHELL - the command backgrounds nginx to loop on
